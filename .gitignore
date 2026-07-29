@@ -1,0 +1,16 @@
+# Secrets and local state — never commit
+config.env
+*.env
+!*.env.example
+data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/

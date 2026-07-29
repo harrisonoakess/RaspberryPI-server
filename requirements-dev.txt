@@ -1,0 +1,5 @@
+# Test tooling for the whole repo. The Pi daemon itself needs nothing beyond
+# the Python 3 standard library; these are only for running the test suite.
+-r server/requirements.txt
+pytest==8.3.4
+httpx==0.28.1

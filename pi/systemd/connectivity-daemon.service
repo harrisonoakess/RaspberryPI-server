@@ -1,0 +1,35 @@
+[Unit]
+Description=Phase 1 Pi -> Railway connectivity daemon
+# Wants/After are ordering hints only: the daemon is designed to start and keep
+# running while WiFi is unavailable.
+Wants=network.target
+After=network.target
+
+# Keep a bad config from hot-looping; failures stay visible in the journal.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=piuploader
+Group=piuploader
+EnvironmentFile=/etc/piuploader/config.env
+ExecStart=/usr/bin/python3 -u /opt/piuploader/connectivity_daemon.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log/piuploader
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
