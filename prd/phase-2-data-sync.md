@@ -174,5 +174,6 @@ None of the following is required to ship Phase 2's file-transfer MVP:
 - Per-device authentication, key rotation workflows, and fleet credential management.
 - A quarantine/retry-limit/operator workflow for a permanently rejected or otherwise poisonous file.
 - Concurrent/horizontal server scaling and migration to object storage plus a managed database.
+- **Known race (accepted for MVP):** `insert_upload` claims the `(device_id, filename)` row before `os.replace` publishes the blob (`server/main.py`). A concurrent duplicate request in that window gets `already_stored` from the row before the blob exists; if the original request's `os.replace` then fails, its cleanup deletes the row after the duplicate's caller may have already treated the file as safely stored. Unreachable with one Pi on a sequential 30-second poll loop and `numReplicas: 1`; revisit if either assumption changes.
 - Broader filesystem support, automatic card discovery, and selecting cards without a provisioned UUID.
 - LTE/cellular connectivity and automatic WiFi discovery/roaming.
