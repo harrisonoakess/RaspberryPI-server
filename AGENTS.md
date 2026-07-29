@@ -7,7 +7,8 @@ Applies to the whole repository and every PRD in `prd/`.
 - Server: FastAPI on Railway, SQLite on a mounted volume. Root `/server`.
 - Pi: Python systemd daemon, Raspberry Pi OS 64-bit (Pi 3B+). Root `/pi`.
 - Deploy independently; coupled only by the HTTP contract in the active PRD.
-- No test tooling chosen yet — document the canonical command when you add it.
+- Tests: pytest. Canonical command from the repo root is
+  `.venv/bin/python -m pytest tests -q` (see README "Tests").
 
 ## Roles (multi-agent)
 - CTO (Opus 5): sets acceptance criteria, slices work by file ownership, approves.

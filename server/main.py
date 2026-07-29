@@ -1,8 +1,10 @@
-"""Phase 1 connectivity server: POST /ping and GET /health.
+"""Pi ingest server: POST /ping, POST /upload, and GET /health.
 
-Persists one row per accepted ping into a SQLite database that lives on a
-Railway volume, so rows survive process restarts, container restarts, and
-redeployments. See prd/phase-1-connection.md.
+Persists one row per accepted ping, and one blob plus one row per accepted
+`(device_id, filename)` upload, into a Railway volume so both survive process
+restarts, container restarts, and redeployments.
+
+See prd/phase-1-connection.md and prd/phase-2-data-sync.md.
 """
 
 from __future__ import annotations
@@ -12,6 +14,8 @@ import os
 import re
 import secrets
 import sqlite3
+import tempfile
+import unicodedata
 from contextlib import asynccontextmanager, closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -20,6 +24,7 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from pydantic import BaseModel, field_validator
+from starlette.datastructures import UploadFile
 
 logger = logging.getLogger("piserver")
 
@@ -31,12 +36,33 @@ RFC3339_UTC_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]00:00)$"
 )
 
+# Phase 2 upload limits. The Pi enforces the same ceiling before it queues a file.
+DEFAULT_MAX_UPLOAD_BYTES = 10_485_760  # 10 MiB
+MAX_FILENAME_CHARACTERS = 255
+# ext4/vfat cap a name at 255 *bytes*; a longer name would fail at open() with
+# ENAMETOOLONG, so reject it as a bad request instead of a server error.
+MAX_FILENAME_BYTES = 255
+UPLOAD_CHUNK_BYTES = 262_144
+# Room for the multipart boundaries, headers, and the two text fields when
+# rejecting an oversized request from its Content-Length alone.
+MULTIPART_ENVELOPE_ALLOWANCE = 65_536
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     device_id TEXT NOT NULL,
     sent_at TEXT NOT NULL,
     received_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS uploads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    stored_path TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    received_at TEXT NOT NULL,
+    UNIQUE (device_id, filename)
 );
 """
 
@@ -47,6 +73,19 @@ class Settings:
 
     api_key: str
     database_path: Path
+    uploads_path: Optional[Path] = None
+    max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES
+
+    @property
+    def uploads_root(self) -> Path:
+        """Directory holding upload blobs.
+
+        Defaults to a sibling of the database so a single configured volume
+        location covers both without a second environment variable.
+        """
+        if self.uploads_path is not None:
+            return self.uploads_path
+        return self.database_path.parent / "uploads"
 
     @staticmethod
     def from_env(env: Optional[dict] = None) -> "Settings":
@@ -54,6 +93,8 @@ class Settings:
         return Settings(
             api_key=env.get("API_KEY", "").strip(),
             database_path=resolve_database_path(env),
+            uploads_path=resolve_uploads_path(env),
+            max_upload_bytes=resolve_max_upload_bytes(env),
         )
 
 
@@ -74,6 +115,36 @@ def resolve_database_path(env: dict) -> Path:
         return Path(volume) / "pings.db"
 
     return Path("data") / "pings.db"
+
+
+def resolve_uploads_path(env: dict) -> Optional[Path]:
+    """Pick the blob directory, or `None` to derive it from the database path.
+
+    Same reasoning as `resolve_database_path`: uploads must land on the Railway
+    volume, because everything outside it disappears on redeploy.
+    """
+    explicit = env.get("UPLOADS_PATH", "").strip()
+    if explicit:
+        return Path(explicit)
+
+    volume = env.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+    if volume:
+        return Path(volume) / "uploads"
+
+    return None
+
+
+def resolve_max_upload_bytes(env: dict) -> int:
+    raw = env.get("MAX_UPLOAD_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_MAX_UPLOAD_BYTES
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"MAX_UPLOAD_BYTES must be an integer, got {raw!r}") from exc
+    if value < 0:
+        raise ValueError(f"MAX_UPLOAD_BYTES must not be negative, got {raw!r}")
+    return value
 
 
 def rfc3339_utc(moment: datetime) -> str:
@@ -133,8 +204,48 @@ class PingResponse(BaseModel):
     received_at: str
 
 
+class UploadResponse(BaseModel):
+    status: str
+    device_id: str
+    filename: str
+    size: int
+    received_at: str
+
+
 class HealthResponse(BaseModel):
     status: str
+
+
+def validate_filename(value: str) -> str:
+    """Return `value` if it is a safe, in-scope CSV basename, else raise.
+
+    Every rule here has to hold before the value is joined to the volume path:
+    a single basename, no separators, no NUL or control characters, not a `.`
+    or `..` component, and a `.csv` suffix. The check is a whitelist of shapes,
+    not a sanitizer — nothing is stripped or rewritten.
+    """
+    if not isinstance(value, str):
+        raise ValueError("filename must be text")
+    if not 1 <= len(value) <= MAX_FILENAME_CHARACTERS:
+        raise ValueError(
+            f"filename must be 1-{MAX_FILENAME_CHARACTERS} characters"
+        )
+    if len(value.encode("utf-8")) > MAX_FILENAME_BYTES:
+        raise ValueError(
+            f"filename must be at most {MAX_FILENAME_BYTES} bytes when UTF-8 encoded"
+        )
+    if "/" in value or "\\" in value:
+        raise ValueError("filename must not contain a path separator")
+    if any(character == "\x00" or unicodedata.category(character) == "Cc" for character in value):
+        raise ValueError("filename must not contain NUL or control characters")
+    if value in (".", ".."):
+        raise ValueError("filename must not be a relative path component")
+    # Defence in depth: after the rules above these are equalities, not fixes.
+    if os.path.basename(value) != value or os.path.dirname(value):
+        raise ValueError("filename must be a single basename")
+    if not value.lower().endswith(".csv"):
+        raise ValueError("filename must end in .csv")
+    return value
 
 
 def connect(database_path: Path) -> sqlite3.Connection:
@@ -158,6 +269,12 @@ def initialize_database(database_path: Path) -> None:
         connection.commit()
 
 
+def initialize_storage(settings: Settings) -> None:
+    """Create the database and the blob directory on the volume."""
+    initialize_database(settings.database_path)
+    settings.uploads_root.mkdir(parents=True, exist_ok=True)
+
+
 def insert_ping(
     database_path: Path, device_id: str, sent_at: str, received_at: str
 ) -> int:
@@ -168,6 +285,48 @@ def insert_ping(
         )
         connection.commit()
         return int(cursor.lastrowid)
+
+
+def find_upload(
+    database_path: Path, device_id: str, filename: str
+) -> Optional[sqlite3.Row]:
+    """Return the stored row for a logical identity, or None."""
+    with closing(connect(database_path)) as connection:
+        connection.row_factory = sqlite3.Row
+        return connection.execute(
+            "SELECT device_id, filename, stored_path, size, received_at "
+            "FROM uploads WHERE device_id = ? AND filename = ?",
+            (device_id, filename),
+        ).fetchone()
+
+
+def insert_upload(
+    database_path: Path,
+    device_id: str,
+    filename: str,
+    stored_path: str,
+    size: int,
+    received_at: str,
+) -> int:
+    """Claim a logical identity. Raises sqlite3.IntegrityError if already taken."""
+    with closing(connect(database_path)) as connection:
+        cursor = connection.execute(
+            "INSERT INTO uploads (device_id, filename, stored_path, size, received_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (device_id, filename, stored_path, size, received_at),
+        )
+        connection.commit()
+        return int(cursor.lastrowid)
+
+
+def delete_upload(database_path: Path, device_id: str, filename: str) -> None:
+    """Release a claimed identity after the blob could not be published."""
+    with closing(connect(database_path)) as connection:
+        connection.execute(
+            "DELETE FROM uploads WHERE device_id = ? AND filename = ?",
+            (device_id, filename),
+        )
+        connection.commit()
 
 
 def get_settings(request: Request) -> Settings:
@@ -193,8 +352,66 @@ def require_api_key(
         raise unauthorized
 
     if not secrets.compare_digest(token.strip(), settings.api_key):
-        logger.warning("Rejected /ping with an invalid bearer token")
+        logger.warning("Rejected an authenticated request with an invalid bearer token")
         raise unauthorized
+
+
+class _FileTooLarge(Exception):
+    """The `file` part exceeded `max_upload_bytes` while being read."""
+
+
+def _form_text(form, field: str) -> str:
+    """Read a required text field, rejecting a missing value or a file part."""
+    value = form.get(field)
+    if value is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{field} is required",
+        )
+    if not isinstance(value, str):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{field} must be a text field, not a file part",
+        )
+    return value
+
+
+def _upload_response(status_value: str, row) -> UploadResponse:
+    return UploadResponse(
+        status=status_value,
+        device_id=row["device_id"],
+        filename=row["filename"],
+        size=int(row["size"]),
+        received_at=row["received_at"],
+    )
+
+
+async def _write_temp_blob(source: UploadFile, directory: Path, limit: int) -> tuple[Path, int]:
+    """Stream `source` into a temporary file in `directory`, enforcing `limit`.
+
+    The completed file is fsynced and closed before it is returned, so the
+    caller only ever publishes bytes that are already on the disk. Any failure
+    removes the temporary file rather than leaving debris on the volume.
+    """
+    handle, temp_name = tempfile.mkstemp(dir=directory, prefix=".incoming-", suffix=".part")
+    temp_path = Path(temp_name)
+    size = 0
+    try:
+        with os.fdopen(handle, "wb") as destination:
+            while True:
+                chunk = await source.read(UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > limit:
+                    raise _FileTooLarge()
+                destination.write(chunk)
+            destination.flush()
+            os.fsync(destination.fileno())
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+    return temp_path, size
 
 
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
@@ -205,11 +422,16 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         # Fail fast rather than start an unauthenticated server.
         if not app.state.settings.api_key:
             raise RuntimeError("API_KEY environment variable is required")
-        initialize_database(app.state.settings.database_path)
-        logger.info("Ping database ready at %s", app.state.settings.database_path)
+        initialize_storage(app.state.settings)
+        logger.info(
+            "Storage ready: database=%s uploads=%s max_upload_bytes=%s",
+            app.state.settings.database_path,
+            app.state.settings.uploads_root,
+            app.state.settings.max_upload_bytes,
+        )
         yield
 
-    app = FastAPI(title="Pi Connectivity Server", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="Pi Ingest Server", version="2.0.0", lifespan=lifespan)
     app.state.settings = resolved
 
     @app.get("/health", response_model=HealthResponse)
@@ -244,6 +466,180 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             device_id=payload.device_id,
             received_at=received_at,
         )
+
+    @app.post(
+        "/upload",
+        response_model=UploadResponse,
+        dependencies=[Depends(require_api_key)],
+    )
+    async def upload(
+        request: Request, settings: Settings = Depends(get_settings)
+    ) -> UploadResponse:
+        """Store one CSV under the logical identity `(device_id, filename)`.
+
+        Delivery from the Pi is at least once, so this handler is idempotent:
+        the `UNIQUE (device_id, filename)` constraint decides which attempt
+        stores the blob, and every later attempt gets `already_stored` with the
+        existing metadata. The endpoint takes a raw `Request` rather than
+        `UploadFile` parameters so authentication and the size ceiling are both
+        applied before the multipart body is parsed.
+        """
+        limit = settings.max_upload_bytes
+        declared = request.headers.get("content-length")
+        if declared is not None:
+            try:
+                declared_bytes = int(declared)
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Content-Length is not a valid integer",
+                )
+            if declared_bytes > limit + MULTIPART_ENVELOPE_ALLOWANCE:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"file must be at most {limit} bytes",
+                )
+
+        try:
+            form = await request.form()
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Request body must be valid multipart/form-data",
+            )
+
+        try:
+            device_id = _form_text(form, "device_id")
+            if not DEVICE_ID_PATTERN.match(device_id):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=(
+                        "device_id must be 1-63 characters of letters, numbers, and "
+                        "internal hyphens, with no leading or trailing hyphen"
+                    ),
+                )
+
+            filename = _form_text(form, "filename")
+            try:
+                validate_filename(filename)
+            except ValueError as exc:
+                # The rejected value is not echoed back or logged verbatim.
+                logger.warning("Rejected an out-of-scope filename from %s", device_id)
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"invalid filename: {exc}",
+                )
+
+            source = form.get("file")
+            if not isinstance(source, UploadFile):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="file must be present as a file part",
+                )
+
+            # Cheap path for a retry whose acknowledgement was lost: answer from
+            # the ledger without rewriting bytes that are already stored.
+            try:
+                existing = find_upload(settings.database_path, device_id, filename)
+            except sqlite3.Error:
+                logger.exception("Could not read the uploads table")
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Could not read stored uploads",
+                )
+            if existing is not None:
+                logger.info(
+                    "Upload already stored: device_id=%s filename=%s size=%s",
+                    device_id,
+                    filename,
+                    existing["size"],
+                )
+                return _upload_response("already_stored", existing)
+
+            device_directory = settings.uploads_root / device_id
+            final_path = device_directory / filename
+            try:
+                device_directory.mkdir(parents=True, exist_ok=True)
+                temp_path, size = await _write_temp_blob(source, device_directory, limit)
+            except _FileTooLarge:
+                logger.warning(
+                    "Rejected oversized upload: device_id=%s filename=%s limit=%s",
+                    device_id,
+                    filename,
+                    limit,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"file must be at most {limit} bytes",
+                )
+            except OSError:
+                logger.exception("Could not buffer upload for device %s", device_id)
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Could not write the uploaded file",
+                )
+
+            received_at = rfc3339_utc(datetime.now(timezone.utc))
+
+            # Claim the identity before publishing the blob, so a concurrent
+            # duplicate can never overwrite a file that is already final.
+            try:
+                insert_upload(
+                    settings.database_path,
+                    device_id,
+                    filename,
+                    str(final_path),
+                    size,
+                    received_at,
+                )
+            except sqlite3.IntegrityError:
+                temp_path.unlink(missing_ok=True)
+                stored = find_upload(settings.database_path, device_id, filename)
+                if stored is None:  # pragma: no cover - defensive
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="Could not persist the upload",
+                    )
+                return _upload_response("already_stored", stored)
+            except sqlite3.Error:
+                temp_path.unlink(missing_ok=True)
+                logger.exception("Could not record upload for device %s", device_id)
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Could not persist the upload",
+                )
+
+            try:
+                os.replace(temp_path, final_path)
+            except OSError:
+                # The row would otherwise point at a blob that does not exist.
+                logger.exception("Could not publish blob for device %s", device_id)
+                try:
+                    delete_upload(settings.database_path, device_id, filename)
+                finally:
+                    temp_path.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Could not store the uploaded file",
+                )
+
+            logger.info(
+                "Stored upload: device_id=%s filename=%s size=%s received_at=%s",
+                device_id,
+                filename,
+                size,
+                received_at,
+            )
+            return UploadResponse(
+                status="stored",
+                device_id=device_id,
+                filename=filename,
+                size=size,
+                received_at=received_at,
+            )
+        finally:
+            # Releases Starlette's own spooled temporary files.
+            await form.close()
 
     return app
 

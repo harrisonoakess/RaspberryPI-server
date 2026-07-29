@@ -1,0 +1,39 @@
+[Unit]
+Description=Phase 2 SD card watcher (copies new CSV files into the upload queue)
+# No network dependency at all: ingestion is expected to work offline.
+After=local-fs.target
+
+# Keep a bad config from hot-looping; failures stay visible in the journal.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=piuploader
+Group=piuploader
+EnvironmentFile=/etc/piuploader/config.env
+ExecStart=/usr/bin/python3 -u /opt/piuploader/sdcard_watcher.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+# The card is mounted read-only by root via the udev rule setup.sh installs, so
+# this service needs no mount privileges. ProtectSystem=strict leaves the unit's
+# namespace with slave mount propagation, so the card appearing on the host
+# propagates in and is visible read-only.
+ProtectSystem=strict
+ProtectHome=yes
+# The queue and ledger are shared with uploader.service. The card mountpoint is
+# deliberately absent: it must stay read-only to this service.
+ReadWritePaths=/var/log/piuploader /var/lib/piuploader
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
