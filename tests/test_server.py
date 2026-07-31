@@ -33,6 +33,11 @@ API_KEY = "test-api-key"
 VALID_BODY = {"device_id": "raspberrypi-uploader", "sent_at": "2026-07-28T18:30:00Z"}
 AUTH = {"Authorization": f"Bearer {API_KEY}"}
 
+# Phase 4 makes both dashboard secrets required at startup, so every app built
+# here needs them even when the test only exercises Phase 1-3 ingest behaviour.
+DASHBOARD_PASSWORD = "test-dashboard-password"
+DASHBOARD_SESSION_SECRET = "test-dashboard-session-secret-0123456789"
+
 DEVICE = "raspberrypi-uploader"
 CARD_A = "1234-ABCD"
 CARD_B = "5678-EF01"
@@ -64,7 +69,13 @@ def uploads_path(tmp_path):
 
 @pytest.fixture
 def settings(db_path, uploads_path):
-    return Settings(api_key=API_KEY, database_path=db_path, uploads_path=uploads_path)
+    return Settings(
+        api_key=API_KEY,
+        database_path=db_path,
+        uploads_path=uploads_path,
+        dashboard_password=DASHBOARD_PASSWORD,
+        dashboard_session_secret=DASHBOARD_SESSION_SECRET,
+    )
 
 
 @pytest.fixture
@@ -961,7 +972,13 @@ def test_rows_survive_process_restart_and_new_pings_still_succeed(settings, db_p
 
 def test_startup_creates_missing_database_directory(tmp_path):
     nested = tmp_path / "volume" / "nested" / "pings.db"
-    with TestClient(create_app(Settings(api_key=API_KEY, database_path=nested))):
+    configured = Settings(
+        api_key=API_KEY,
+        database_path=nested,
+        dashboard_password=DASHBOARD_PASSWORD,
+        dashboard_session_secret=DASHBOARD_SESSION_SECRET,
+    )
+    with TestClient(create_app(configured)):
         assert nested.exists()
 
 

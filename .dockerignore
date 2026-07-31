@@ -1,0 +1,44 @@
+# Keep the build context to source only. Anything listed here either does not
+# belong in an image (secrets, local data) or would make the build
+# non-deterministic (host-installed dependencies, caches).
+
+.git/
+.gitignore
+.github/
+
+# Local secrets and local state
+*.env
+!*.env.example
+config.env
+data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.csv
+uploads/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node: dependencies are installed inside the build stage from the lockfile
+frontend/node_modules/
+frontend/dist/
+npm-debug.log*
+
+# Not part of the server image
+pi/
+tests/
+prd/
+README.md
+AGENTS.md
+requirements-dev.txt
+
+# macOS
+.DS_Store

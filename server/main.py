@@ -1,4 +1,4 @@
-"""Pi ingest server: POST /ping, POST /upload, and GET /health.
+"""Pi ingest server: POST /ping, POST /upload, GET /health, and /dashboard.
 
 Persists one row per accepted ping, and one blob plus one row per accepted
 `(device_id, card_uuid, filename)` upload, into a Railway volume so both
@@ -8,8 +8,11 @@ The `card_uuid` segment is what lets one Pi deliver files from several SD cards
 over its lifetime: two cards can each carry a `logger-0001.csv`, and those are
 two distinct files, not one file uploaded twice.
 
-See prd/phase-1-connection.md, prd/phase-2-data-sync.md, and
-prd/phase-3-multi-card-ingestion.md.
+The private read-only dashboard and its JSON APIs live under `/dashboard`, in
+`dashboard.py`, served from this same process and origin.
+
+See prd/phase-1-connection.md, prd/phase-2-data-sync.md,
+prd/phase-3-multi-card-ingestion.md, and prd/phase-4-frontend-dashboard.md.
 """
 
 from __future__ import annotations
@@ -31,6 +34,8 @@ from typing import Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from pydantic import BaseModel, field_validator
 from starlette.datastructures import UploadFile
+
+import dashboard
 
 logger = logging.getLogger("piserver")
 
@@ -107,6 +112,15 @@ class Settings:
     # One-time Phase 2 -> Phase 3 authorization. A no-op once the uploads table
     # already has the Phase 3 schema, so leaving it set cannot destroy new data.
     reset_uploads: bool = False
+    # Phase 4 dashboard credentials. Neither is stripped or normalized: the
+    # password is compared exactly, and trimming the secret would silently
+    # reduce its entropy.
+    dashboard_password: str = ""
+    dashboard_session_secret: str = ""
+    # `Secure` on the session cookie, set whenever the process is running on
+    # Railway. Omitted only for plain-HTTP local development.
+    secure_cookies: bool = False
+    dashboard_dist_path: Optional[Path] = None
 
     @property
     def uploads_root(self) -> Path:
@@ -119,6 +133,13 @@ class Settings:
             return self.uploads_path
         return self.database_path.parent / "uploads"
 
+    @property
+    def dashboard_dist_root(self) -> Path:
+        """Directory holding the compiled frontend the Docker build copies in."""
+        if self.dashboard_dist_path is not None:
+            return self.dashboard_dist_path
+        return Path(__file__).resolve().parent / "static"
+
     @staticmethod
     def from_env(env: Optional[dict] = None) -> "Settings":
         env = os.environ if env is None else env
@@ -128,6 +149,10 @@ class Settings:
             uploads_path=resolve_uploads_path(env),
             max_upload_bytes=resolve_max_upload_bytes(env),
             reset_uploads=resolve_reset_uploads(env),
+            dashboard_password=env.get("DASHBOARD_PASSWORD", ""),
+            dashboard_session_secret=env.get("DASHBOARD_SESSION_SECRET", ""),
+            secure_cookies=resolve_secure_cookies(env),
+            dashboard_dist_path=resolve_dashboard_dist_path(env),
         )
 
 
@@ -183,6 +208,26 @@ def resolve_max_upload_bytes(env: dict) -> int:
 def resolve_reset_uploads(env: dict) -> bool:
     """Whether `PHASE3_RESET_UPLOADS` authorizes the one-time uploads reset."""
     return env.get("PHASE3_RESET_UPLOADS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def resolve_secure_cookies(env: dict) -> bool:
+    """Whether the dashboard session cookie carries `Secure`.
+
+    Keyed on Railway's own deployment identifiers rather than on whether a
+    volume happens to be mounted, so a locally mounted volume cannot make the
+    cookie unusable over plain HTTP, and a Railway deployment without one still
+    gets the attribute.
+    """
+    return bool(
+        env.get("RAILWAY_ENVIRONMENT_ID", "").strip()
+        or env.get("RAILWAY_DEPLOYMENT_ID", "").strip()
+    )
+
+
+def resolve_dashboard_dist_path(env: dict) -> Optional[Path]:
+    """Explicit location of the compiled frontend, or `None` for the default."""
+    explicit = env.get("DASHBOARD_DIST_PATH", "").strip()
+    return Path(explicit) if explicit else None
 
 
 def rfc3339_utc(moment: datetime) -> str:
@@ -548,6 +593,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         # Fail fast rather than start an unauthenticated server.
         if not app.state.settings.api_key:
             raise RuntimeError("API_KEY environment variable is required")
+        dashboard.validate_dashboard_settings(app.state.settings)
         initialize_storage(app.state.settings)
         logger.info(
             "Storage ready: database=%s uploads=%s max_upload_bytes=%s",
@@ -557,8 +603,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         )
         yield
 
-    app = FastAPI(title="Pi Ingest Server", version="3.0.0", lifespan=lifespan)
+    app = FastAPI(title="Pi Ingest Server", version="4.0.0", lifespan=lifespan)
     app.state.settings = resolved
+    dashboard.register_dashboard(app)
 
     @app.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:

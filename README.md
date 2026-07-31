@@ -1,15 +1,20 @@
-# Pi → Railway SD Card Ingestion (Phase 3)
+# Pi → Railway SD Card Ingestion (Phase 4)
 
 A Raspberry Pi copies new CSV files off removable SD cards and uploads them to a
 FastAPI server on Railway whenever it has WiFi. Cards are swapped one at a time,
 and each one is detected, mounted read-only, and ingested with no operator
 command. Files never get lost during connectivity gaps, and re-inserting the
 same card never duplicates a stored file. Built on the Phase 1 connection, which
-is still here as the `/ping` heartbeat. See `prd/phase-1-connection.md`,
-`prd/phase-2-data-sync.md`, and `prd/phase-3-multi-card-ingestion.md`.
+is still here as the `/ping` heartbeat. Phase 4 adds a private, read-only
+dashboard at `/dashboard`, served by the same FastAPI process, for checking that
+the Pi is still reporting in and browsing what has been stored. See
+`prd/phase-1-connection.md`, `prd/phase-2-data-sync.md`,
+`prd/phase-3-multi-card-ingestion.md`, and `prd/phase-4-frontend-dashboard.md`.
 
-The server (`/server`) and the Pi services (`/pi`) deploy independently and are
-coupled only by the HTTP contract below.
+The Pi services (`/pi`) deploy independently and are coupled to the server only
+by the HTTP contract below. The server (`/server`) and the dashboard frontend
+(`/frontend`) are built together into one image and run as one Railway service
+on one origin.
 
 ## How it works
 
@@ -62,9 +67,17 @@ malformed or mismatched JSON — leaves the file pending for the next poll.
 ## Layout
 
 ```text
+Dockerfile                    multi-stage build: Node builds the dashboard, Python runs it
+.dockerignore                 keeps local state and node_modules out of the build context
 server/
   main.py                     FastAPI app: POST /ping, POST /upload, GET /health
+  dashboard.py                private read-only dashboard: session auth + read APIs
   railway.json                Railway deploy config
+  .env.example                local backend secrets template (real .env is gitignored)
+frontend/
+  src/                        React + TypeScript dashboard served under /dashboard
+  package.json                npm scripts: dev, build, typecheck, test
+  .nvmrc                      the exact Node version the Docker build also uses
 pi/
   sdcard_mounter.py           root: polls for a qualifying card, mounts it read-only
   sdcard_watcher.py           derives the card_uuid, copies new CSVs into the queue
@@ -78,8 +91,6 @@ pi/
     uploader.service
 tests/                        test suite derived from the PRD success criteria
 prd/                          phase PRDs
-tools/
-  railway_viewer.py           local read-only Railway data viewer
 ```
 
 ## HTTP contract
@@ -89,6 +100,15 @@ tools/
 | `GET /health` | none | `200 {"status":"ok"}` | — |
 | `POST /ping` | `Authorization: Bearer <API_KEY>` | `200 {"status":"acknowledged","device_id":…,"received_at":…}` | `401` bad/missing token, `422` invalid body, `503` cannot persist |
 | `POST /upload` | `Authorization: Bearer <API_KEY>` | `200 {"status":"stored"\|"already_stored","device_id":…,"card_uuid":…,"filename":…,"size":…,"received_at":…}` | `401` bad/missing token, `413` over 20 MiB, `400`/`422` missing field or unsafe filename/device_id/card_uuid, `500`/`503` cannot persist |
+| `POST /dashboard/api/session` | password body | `204` + `dashboard_session` cookie | `401` wrong password, `422` bad body, `429` throttled |
+| `GET /dashboard/api/session` | session cookie | `200 {"authenticated":true,"expires_at":…}` | `401` missing/expired/tampered |
+| `DELETE /dashboard/api/session` | none | `204`, always | — |
+| `GET /dashboard/api/status` | session cookie | `200 {"status":"online"\|"offline"\|"never_seen",…}` | `401`, `503` cannot read |
+| `GET /dashboard/api/uploads` | session cookie | `200 {"items":[…],"next_before_id":…}` | `401`, `422` bad `limit`/`before_id`, `503` cannot read |
+| `GET /dashboard/api/uploads/{id}/preview` | session cookie | `200 {"upload_id":…,"filename":…,"card_uuid":…,"records":[[…]],"truncated":…}` | `401`, `404` unknown id, `409` file missing/out of root, `422` bad id or unreadable CSV, `503` cannot read |
+
+The dashboard endpoints never accept the ingest `API_KEY`, and the ingest
+endpoints never accept a dashboard session. See [Dashboard](#dashboard).
 
 ### `POST /ping`
 
@@ -148,8 +168,8 @@ Example success:
 }
 ```
 
-Retrieval, listing, and preview endpoints are deliberately out of scope. Receipt
-is verified by direct Volume and SQLite inspection.
+Ingest itself has no retrieval endpoints. Reading stored data is the
+[dashboard](#dashboard)'s job, behind its own separate credential.
 
 ## Tests
 
@@ -167,24 +187,61 @@ Phase 2 reset guards on both sides, mounter candidate filtering and
 reconciliation, card discovery and mount-change safety in the watcher, per-card
 queueing and reinsertion dedup, the nested queue the uploader drains, the
 acknowledgement rules that gate deleting a local copy, WiFi detection, the poll
-and heartbeat cadences, the log rate limiter, and the local Railway viewer.
+and heartbeat cadences, and the log rate limiter. They also cover the dashboard:
+startup configuration guards, login throttling, session signing and expiry, the
+read-API contracts, the status time boundary, cursor pagination, safe path
+validation, the CSV preview limits, and every failure response.
+
+The dashboard frontend has its own non-interactive commands, from `frontend/`:
+
+```bash
+npm ci          # honours package-lock.json, same as the Docker build
+npm run typecheck
+npm test        # Vitest + React Testing Library
+npm run build   # production Vite build
+```
 
 Hardware and platform behaviour (real cards, real mounts, real WiFi association,
-systemd, Railway volumes) is **not** covered by the suite and is verified
-manually below.
+systemd, Railway volumes) is **not** covered by either suite and is verified
+manually below, as is the [browser smoke test](#browser-smoke-test).
 
 ## Local server
 
+Copy the secrets template once, then edit `server/.env`. It is gitignored and
+never reaches the image or the frontend bundle:
+
 ```bash
-cd server
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-API_KEY=local-dev-key RAILWAY_VOLUME_MOUNT_PATH=./data \
-  .venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+cp server/.env.example server/.env
+python3 -c 'import secrets; print(secrets.token_urlsafe(48))'   # session secret
 ```
 
-The server refuses to start without `API_KEY`. `DATABASE_PATH` and
+Run the backend from the repo root, loading that file into the environment:
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+set -a && source server/.env && set +a
+.venv/bin/python -m uvicorn main:app --app-dir server --host 127.0.0.1 --port 8000 --reload
+```
+
+The server refuses to start unless `API_KEY`, `DASHBOARD_PASSWORD`, and
+`DASHBOARD_SESSION_SECRET` are all set, the session secret is at least 32 UTF-8
+bytes, and the dashboard password differs from `API_KEY`. `DATABASE_PATH` and
 `UPLOADS_PATH` override the volume-derived defaults
 (`<volume>/pings.db`, `<volume>/uploads`).
+
+For the dashboard UI, run Vite in a second terminal and open
+<http://127.0.0.1:5173/dashboard/>:
+
+```bash
+cd frontend && npm ci && npm run dev
+```
+
+Vite proxies `/dashboard/api` to FastAPI on port 8000, so the login flow uses
+the real cookie. Because local FastAPI is plain HTTP, the session cookie omits
+`Secure` locally; on Railway it always carries it. To exercise the compiled
+build against FastAPI instead, `npm run build` and start the backend with
+`DASHBOARD_DIST_PATH=$PWD/frontend/dist`, then open
+<http://127.0.0.1:8000/dashboard>.
 
 ### Verify the upload contract
 
@@ -244,73 +301,44 @@ sizes matching the source files, and nothing at all from the rejected requests.
 
 One service, one replica — Railway volumes do not support multiple replicas.
 
-1. **Service** → *Settings* → set **Root Directory** to `/server`.
-   `railway.json` supplies the start command, `numReplicas: 1`, and a `/health`
-   healthcheck.
+1. **Service** → *Settings* → set **Root Directory** to `/` (the repository
+   root) and **Config File Path** to `/server/railway.json`. Phase 4 moved the
+   root directory off `/server` so the Docker build context contains both
+   `frontend/` and `server/`; the deploy configuration stayed in `server/`.
+   `railway.json` selects the `DOCKERFILE` builder and supplies the start
+   command, `numReplicas: 1`, and a `/health` healthcheck.
 2. **Volume** → attach one, mount path `/data`. Railway injects
    `RAILWAY_VOLUME_MOUNT_PATH`, and the server puts `pings.db` and `uploads/`
    inside it. Size the volume for the CSVs you expect to keep: nothing is
    deleted automatically.
-3. **Variables** → `API_KEY=<long random string>`. Generate with
-   `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`.
-   Use the same value in the Pi's `config.env`. `PHASE3_RESET_UPLOADS` is set
-   only for the one-time Phase 2 → Phase 3 rollout below, then removed.
-4. **Networking** → generate a public domain. That HTTPS URL is `SERVER_URL`.
+3. **Variables** → three secrets, all required:
+
+   | Variable | Purpose | Generate with |
+   | --- | --- | --- |
+   | `API_KEY` | Pi ingest bearer token; same value in the Pi's `config.env` | `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'` |
+   | `DASHBOARD_PASSWORD` | typed into the dashboard login form | your choice, but **not** equal to `API_KEY` |
+   | `DASHBOARD_SESSION_SECRET` | signs the session cookie; ≥ 32 UTF-8 bytes | `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'` |
+
+   Nobody ever types `DASHBOARD_SESSION_SECRET`, so generate it randomly rather
+   than choosing a long phrase — a memorable phrase is not equivalent entropy.
+   Changing it invalidates every existing session. The deploy fails fast and
+   logs `REFUSING TO START` if any of the three is missing, if the secret is too
+   short, or if `DASHBOARD_PASSWORD` equals `API_KEY`.
+   `PHASE3_RESET_UPLOADS` is set only for the one-time Phase 2 → Phase 3
+   rollout below, then removed.
+4. **Networking** → generate a public domain. That HTTPS URL is `SERVER_URL`,
+   and `SERVER_URL/dashboard` is the dashboard.
 
 The database and uploads directory are created at application startup, not at
 build or pre-deploy time, so they land on the mounted volume.
 
-### Local data viewer
-
-For a quick visual confirmation that pings and uploads reached Railway, run the
-local read-only viewer. It needs:
-
-- Python 3; the viewer itself uses only the standard library.
-- The Railway CLI installed (`railway --version` should succeed).
-- A Railway login and a link to this project's server service:
-
-  ```bash
-  railway login
-  railway link
-  ```
-
-From the repository root, start it:
-
-```bash
-.venv/bin/python tools/railway_viewer.py
-```
-
-Open <http://127.0.0.1:8765>. Use **Refresh** to reload the latest 50 pings and
-uploads, newest first. Upload rows include the card UUID so same-named files
-from different cards remain distinguishable. Use **Preview** beside an upload
-to show its card UUID and first 100 CSV records. To choose another local port:
-
-```bash
-.venv/bin/python tools/railway_viewer.py --port 9000
-```
-
-The page is local-only: the Python server binds to `127.0.0.1` and cannot be
-reached from another computer. Each refresh or preview runs a fixed Python
-read through `railway ssh` against the currently linked service. SQLite is
-opened in strict read-only/query-only mode, and there are no edit or delete
-operations. The viewer follows the server's database path precedence:
-`DATABASE_PATH`, then `$RAILWAY_VOLUME_MOUNT_PATH/pings.db`, then
-`data/pings.db`. Stored file paths, the ingest API key, and Railway credentials
-are never sent to the browser. The ingest `API_KEY` is not needed to use this
-viewer.
-
-To verify it manually:
-
-1. Send a `/ping` or `/upload` using the commands below, or let the Pi send one.
-2. Start the viewer and confirm the new row appears after **Refresh**.
-3. For an upload, select **Preview** and compare the displayed records with the
-   source CSV.
-4. Stop the viewer with `Ctrl-C`.
-
-An error in the page will identify common local problems such as a missing
-Railway CLI, expired login, unlinked project/service, timeout, missing database
-or CSV, malformed CSV, or non-UTF-8 data. No Railway service changes are made
-by starting the viewer.
+The image is built by the repository-root `Dockerfile`: a Node stage installs
+from `frontend/package-lock.json` with `npm ci`, runs the frontend type check,
+tests, and production build, then a Python stage installs the pinned server
+requirements and copies in only `main.py`, `dashboard.py`, and the compiled
+`dist/`. Both base images are pinned to an exact patch tag and an immutable
+digest. No `node_modules`, frontend source, test file, or Pi file reaches the
+runtime image.
 
 ### Railway receipt check
 
@@ -350,6 +378,82 @@ Run in order: `ping` → restart the service → `rows` → `ping` → redeploy 
 
 A deployment with an attached volume has a brief downtime window during
 redeploy. A ping or upload that fails then succeeds on the next poll.
+
+## Dashboard
+
+`SERVER_URL/dashboard` is a private, single-administrator page for answering two
+questions: is the Pi still checking in, and what has been stored? It is served
+by the same FastAPI process on the same origin as ingest.
+
+**It is read-only.** There is no upload, edit, delete, retention, or full-file
+download path — not hidden, not disabled, absent. Its APIs open SQLite with
+`query_only` set, so the database refuses writes from the dashboard even if a
+future change tried to make one.
+
+### Signing in
+
+Open `SERVER_URL/dashboard` and enter `DASHBOARD_PASSWORD`. That is a different
+credential from the Pi's `API_KEY`, and the two are never interchangeable: the
+ingest key cannot sign in, a dashboard session cannot ingest, and the server
+refuses to start if the two values are equal.
+
+- A successful login sets a signed `dashboard_session` cookie that is valid for
+  12 hours. It is `HttpOnly`, `SameSite=Strict`, scoped to `/dashboard`, and
+  `Secure` on Railway. The password is never stored in the URL, in browser
+  storage, or in any response.
+- Five failed attempts from one source address within 15 minutes lock further
+  attempts out with `429` until the oldest failure ages out — including attempts
+  with the correct password. A successful login clears the counter. The counter
+  is in memory, so restarting the service clears it too.
+- **Sign out** expires the cookie. Sessions are stateless and signed, so a
+  restart or redeploy does *not* invalidate one that is still inside its 12
+  hours; rotate `DASHBOARD_SESSION_SECRET` to invalidate every session at once.
+
+### Reading the connection card
+
+The card says **Online**, **Offline**, or **Never seen**, plus the exact
+last-heartbeat time. It refreshes every 60 seconds and on **Refresh**.
+
+Online means a heartbeat was *received* within the last 10 minutes. That is an
+inference from recent check-ins, not proof of a live connection — the wording on
+the card says "last heartbeat" for exactly that reason. Ten minutes allows one
+missed heartbeat at the recommended five-minute cadence. The time shown is the
+server-authored `received_at`, not the Pi-authored `sent_at`, so a Pi with a
+wrong clock cannot make itself look recent. If the status read fails, the card
+says **unavailable** rather than offline: a server fault is not the Pi's fault.
+
+### Browsing and previewing
+
+The uploads table lists every stored file newest first, with its card UUID, so
+two `logger-0001.csv` files from two different physical cards stay
+distinguishable. **Load more** pages through the rest.
+
+**Preview** opens the first records of a file as raw CSV cells. It shows at most
+100 records and about 1 MB of cell content, and says so when it truncates. Empty
+files, non-UTF-8 bytes, malformed CSV, and missing blobs each get their own
+message. Stored paths, environment variables, and filesystem details never reach
+the browser.
+
+### Browser smoke test
+
+Automated tests do not exercise a real browser, so run this once against the
+production build after deploying, at a desktop width and again at a phone width
+(around 390 px):
+
+1. Visit `SERVER_URL/dashboard` signed out. Only the password form is visible.
+2. Enter a wrong password: a generic error, no dashboard content.
+3. Sign in. The connection card appears first, with a visible last-heartbeat
+   time. Confirm the Pi's next heartbeat lands within one 60-second refresh.
+4. Upload a CSV from the Pi (or with the receipt-check `curl` above) and confirm
+   the new row appears after **Refresh**, with the right card UUID and size.
+5. Open **Preview**, check the records against the source file, close with
+   `Esc`, and confirm focus returns to the button that opened it.
+6. Open a different file's preview and confirm none of the previous file's rows
+   are shown.
+7. Tab through the page: every control is reachable and has a visible focus
+   ring. The page itself never scrolls sideways — wide tables scroll inside
+   their own container.
+8. Sign out and confirm the dashboard is gone and the password form is back.
 
 ## Phase 2 → Phase 3 rollout (one time)
 
@@ -655,6 +759,32 @@ Record the commands and results for each.
 - One shared bearer token: Railway variable on the server,
   `/etc/piuploader/config.env` (`root:piuploader 0640`) on the Pi. Compared with
   a constant-time check. Per-device auth and key rotation are post-MVP.
+- **Two separate credentials.** The dashboard has its own password and its own
+  cookie session; the ingest `API_KEY` cannot sign in to it, and startup fails if
+  the two values are equal. Neither the ingest key nor any dashboard secret is a
+  Vite variable, so neither can be compiled into a browser asset. Passwords are
+  compared as fixed-length SHA-256 digests with `hmac.compare_digest`, which
+  stays constant-time for non-ASCII input, and failures return one generic
+  message that reveals nothing about the configuration.
+- Dashboard session cookies are stateless and signed with HMAC-SHA-256 over the
+  issued-at and expiry pair. A tampered signature, a payload whose lifetime is
+  not exactly 12 hours, or an expired one is rejected and the cookie is cleared.
+  There is no server-side session store to leak or grow.
+- Login throttling keys on the **rightmost** `X-Forwarded-For` value, which is
+  the one Railway appends; values to its left are client-supplied and are not
+  trusted, so a spoofed header cannot reset a source's failure count.
+- Dashboard responses carry `no-store`, `nosniff`, `Referrer-Policy:
+  same-origin`, and a CSP that keeps scripts, connections, images, fonts, forms,
+  and framing on the same origin and never permits inline script. Inline
+  *styles* are allowed only because the modal dialog sets them at runtime; that
+  allowance does not touch `script-src`.
+- The compiled login shell and its hashed assets are readable before signing in,
+  because the browser needs them to draw the password form. They contain no
+  credentials and no stored data. Authentication protects the read APIs and what
+  the page renders, not the secrecy of compiled frontend code.
+- CSV previews resolve a path only from a row selected by integer upload ID, and
+  re-check that the resolved path is inside the uploads root before opening it.
+  A row pointing anywhere else is a `409`, not a file read.
 - `sdcard-watcher` and `uploader` run as the non-root `piuploader` user with
   `NoNewPrivileges`, `ProtectSystem=strict`, and write access limited to
   `/var/log/piuploader` and `/var/lib/piuploader`. Neither has mount privileges.

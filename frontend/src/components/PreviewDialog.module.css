@@ -1,0 +1,143 @@
+.trigger {
+  padding: 0.35rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.trigger:hover {
+  border-color: var(--accent);
+}
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgb(0 0 0 / 55%);
+}
+
+.content {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: min(56rem, calc(100vw - 2rem));
+  max-height: calc(100vh - 2rem);
+  overflow-y: auto;
+  padding: 1.25rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.title {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 1.125rem;
+  overflow-wrap: anywhere;
+}
+
+.description {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.875rem;
+}
+
+.state {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+.error {
+  margin: 0;
+  padding: 0.6rem 0.7rem;
+  border-radius: var(--radius);
+  background: var(--offline-surface);
+  color: var(--offline);
+}
+
+/* The cell grid scrolls sideways inside the dialog, not the page. */
+.gridScroll {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.grid {
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 0.875rem;
+}
+
+.grid th,
+.grid td {
+  text-align: left;
+  padding: 0.35rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  white-space: pre;
+}
+
+.grid thead th {
+  position: sticky;
+  top: 0;
+  background: var(--surface-sunken);
+  font-family: var(--font);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-muted);
+}
+
+.rowNumber,
+.rowNumberHeading {
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.cell {
+  max-width: 24rem;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.truncated {
+  margin: 0;
+  padding: 0.5rem 0.7rem;
+  border-radius: var(--radius);
+  background: var(--neutral-surface);
+  color: var(--text-muted);
+  font-size: 0.875rem;
+}
+
+.close {
+  align-self: flex-start;
+  padding: 0.5rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.close:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.visuallyHidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}

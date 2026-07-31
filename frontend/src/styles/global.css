@@ -1,0 +1,73 @@
+:root {
+  --surface: #ffffff;
+  --surface-sunken: #f4f5f7;
+  --border: #d6d9de;
+  --text: #16191d;
+  --text-muted: #5c636e;
+  --accent: #1f5fbf;
+  --online: #1a7f37;
+  --online-surface: #e6f4ea;
+  --offline: #b42318;
+  --offline-surface: #fdeceb;
+  --neutral: #5c636e;
+  --neutral-surface: #eeeff2;
+  --focus: #1f5fbf;
+  --radius: 8px;
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: #191c20;
+    --surface-sunken: #101317;
+    --border: #333a42;
+    --text: #eef1f4;
+    --text-muted: #a3abb6;
+    --accent: #7aa8f0;
+    --online: #6ddc8b;
+    --online-surface: #16311f;
+    --offline: #ff9c92;
+    --offline-surface: #3a1c19;
+    --neutral: #a3abb6;
+    --neutral-surface: #23272c;
+    --focus: #7aa8f0;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-text-size-adjust: 100%;
+}
+
+/* A visible focus ring everywhere, including on the Radix dialog's controls. */
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: progress;
+  opacity: 0.65;
+}

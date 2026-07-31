@@ -5,10 +5,14 @@ Applies to the whole repository and every PRD in `prd/`.
 
 ## Stack
 - Server: FastAPI on Railway, SQLite on a mounted volume. Root `/server`.
+- Frontend: React + TypeScript + Vite dashboard. Root `/frontend`. Built into
+  the server image by the repo-root `Dockerfile`; same process, same origin.
 - Pi: Python systemd daemon, Raspberry Pi OS 64-bit (Pi 3B+). Root `/pi`.
-- Deploy independently; coupled only by the HTTP contract in the active PRD.
+- The Pi deploys independently of the server; they are coupled only by the HTTP
+  contract in the active PRD. Server and frontend deploy together.
 - Tests: pytest. Canonical command from the repo root is
-  `.venv/bin/python -m pytest tests -q` (see README "Tests").
+  `.venv/bin/python -m pytest tests -q` (see README "Tests"). The frontend adds
+  `npm run typecheck`, `npm test`, and `npm run build` from `/frontend`.
 
 ## Roles (multi-agent)
 - CTO (Opus 5): sets acceptance criteria, slices work by file ownership, approves.

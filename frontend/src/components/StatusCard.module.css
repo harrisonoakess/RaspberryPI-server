@@ -1,0 +1,85 @@
+.card {
+  padding: 1.25rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.heading {
+  margin: 0 0 0.75rem;
+  font-size: 1rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.body {
+  min-width: 0;
+}
+
+.loading {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+.line {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  margin: 0;
+  padding: 0.6rem 0.75rem;
+  border-radius: var(--radius);
+  font-size: 1.125rem;
+  font-weight: 600;
+  flex-wrap: wrap;
+}
+
+.glyph {
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.headline {
+  min-width: 0;
+}
+
+/* Colour reinforces the glyph and wording; it is never the only signal. */
+.online {
+  background: var(--online-surface);
+  color: var(--online);
+}
+
+.offline {
+  background: var(--offline-surface);
+  color: var(--offline);
+}
+
+.neverSeen,
+.unavailable {
+  background: var(--neutral-surface);
+  color: var(--neutral);
+}
+
+.details {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.5rem;
+  margin: 0.9rem 0 0;
+}
+
+.detail dt {
+  font-size: 0.8125rem;
+  color: var(--text-muted);
+}
+
+.detail dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 0.9375rem;
+}
+
+.note {
+  margin: 0.75rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
