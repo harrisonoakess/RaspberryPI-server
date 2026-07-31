@@ -29,6 +29,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -60,6 +61,29 @@ COPY_CHUNK_BYTES = 262_144
 CATEGORY_CARD_ABSENT = "card_absent"
 CATEGORY_CARD_NOT_MOUNTED = "card_not_mounted"
 CATEGORY_SCAN_FAILED = "scan_failed"
+
+
+def resolve_card_scan_subdir(env: dict) -> str:
+    """Read and validate `CARD_SCAN_SUBDIR`, or "" for the card root.
+
+    A whitelist of shapes, like the filename rules: the value either passes as
+    given or is rejected, because it is joined to the mountpoint before any
+    file is read. An absolute path or a `..` component would escape the
+    read-only mount, so both are refused outright rather than normalized away.
+    """
+    raw = env.get("CARD_SCAN_SUBDIR", "").strip().strip("/")
+    if not raw:
+        return ""
+    if "\\" in raw:
+        raise ConfigError("CARD_SCAN_SUBDIR must use / as its separator")
+    if any(character == "\x00" or unicodedata.category(character) == "Cc" for character in raw):
+        raise ConfigError("CARD_SCAN_SUBDIR must not contain NUL or control characters")
+    segments = [segment for segment in raw.split("/") if segment]
+    if not segments or any(segment in (".", "..") for segment in segments):
+        raise ConfigError(
+            f"CARD_SCAN_SUBDIR must be a relative path inside the card, got {raw!r}"
+        )
+    return "/".join(segments)
 
 
 class CardError(Exception):
@@ -99,6 +123,22 @@ class WatcherConfig:
     log_max_bytes: int = 1_048_576
     log_backup_count: int = 5
     by_uuid_root: Path = DEFAULT_BY_UUID_ROOT
+    # Subdirectory of the card holding the CSVs, "" for the card root. Garmin
+    # avionics cards keep flight logs under `data_log/` rather than at the root,
+    # and the card is read-only media that cannot be rearranged to suit us.
+    card_scan_subdir: str = ""
+
+    @property
+    def scan_root(self) -> Path:
+        """Directory scanned for CSVs: the mountpoint, or a subdirectory of it.
+
+        Only this path is scanned — the search is still one level deep, so a
+        card whose logs sit two directories down needs the full relative path
+        in `CARD_SCAN_SUBDIR`.
+        """
+        if not self.card_scan_subdir:
+            return self.card_mountpoint
+        return self.card_mountpoint / self.card_scan_subdir
 
     @property
     def pending_dir(self) -> Path:
@@ -136,6 +176,7 @@ class WatcherConfig:
 
         return WatcherConfig(
             card_mountpoint=Path(mountpoint),
+            card_scan_subdir=resolve_card_scan_subdir(env),
             queue_path=Path(env.get("QUEUE_PATH", "").strip() or DEFAULT_QUEUE_PATH),
             state_db_path=Path(
                 env.get("STATE_DB_PATH", "").strip() or DEFAULT_STATE_DB_PATH
@@ -196,16 +237,22 @@ def discover_card(config: WatcherConfig) -> Optional[CardIdentity]:
     return None
 
 
-def in_scope_files(mountpoint: Path) -> list:
-    """Root-level regular `.csv` files on the card, sorted by name.
+def in_scope_files(scan_root: Path) -> list:
+    """Regular `.csv` files directly in `scan_root`, sorted by name.
 
     Directories, symlinks, and dotfile metadata are out of scope, and nested
     directories are not descended into.
+
+    The dotfile rule is not cosmetic. A card that has been read on a Mac comes
+    back carrying AppleDouble sidecars — `._log_1.csv` beside `log_1.csv` —
+    which are resource-fork metadata, not flight data, yet match every other
+    rule here. Uploading them would put junk rows in the ledger under names
+    that look legitimate.
     """
     try:
-        entries = list(os.scandir(mountpoint))
+        entries = list(os.scandir(scan_root))
     except OSError as exc:
-        raise CardError(f"cannot list {mountpoint}: {exc}") from exc
+        raise CardError(f"cannot list {scan_root}: {exc}") from exc
 
     candidates = []
     for entry in entries:
@@ -215,6 +262,8 @@ def in_scope_files(mountpoint: Path) -> list:
             if not entry.is_file(follow_symlinks=False):
                 continue
         except OSError:
+            continue
+        if entry.name.startswith("."):
             continue
         if not entry.name.lower().endswith(".csv"):
             continue
@@ -299,11 +348,11 @@ def ingest_card(
     on the card is modified or deleted.
     """
     result = IngestResult()
-    names = in_scope_files(config.card_mountpoint)
+    names = in_scope_files(config.scan_root)
     known = ledger.known_filenames(card.uuid)
     logger.info(
         "scanning %s (card %s): %d in-scope csv file(s)",
-        config.card_mountpoint,
+        config.scan_root,
         card.uuid,
         len(names),
     )
@@ -326,7 +375,7 @@ def ingest_card(
             result.aborted = True
             break
 
-        source = config.card_mountpoint / name
+        source = config.scan_root / name
         try:
             size = source.stat().st_size
         except OSError as exc:

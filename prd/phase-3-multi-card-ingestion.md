@@ -25,7 +25,7 @@ This phase makes card swapping fully automatic and makes both the local and serv
 - Distinguishing cloned filesystems that share a UUID. Duplicate UUIDs across cards are unsupported and must be corrected before both cards are used.
 - Treating a reformatted card as the same logical card. If formatting changes its UUID, its retained CSV files are ingested again under the new identity.
 - A manual UUID override. The trusted, single-reader workflow does not need one in this phase.
-- Any change to the data format itself — real cards produce the same root-level `.csv` files with the same columns as the mock data used in Phase 2 testing.
+- Any change to the data format itself — real cards produce `.csv` files with the same columns as the mock data used in Phase 2 testing. (Corrected 2026-07-31: the first real Garmin card kept its logs under `data_log/`, not at the card root as assumed here, and carried macOS AppleDouble sidecars. The watcher gained `CARD_SCAN_SUBDIR` and a dotfile filter; the columns themselves were unchanged.)
 - Everything already declared out of scope in Phase 2 §3 and not explicitly revisited above (content-hash verification, LTE/cellular, WiFi roaming, high-throughput optimization, fleet management, horizontal scaling).
 - Migrating existing test-era data. Local ledger, local queue, and server-side upload records from mock-card testing are wiped, not migrated (see §7.1).
 - Updating the local Railway viewer or implementing Phase 4 UI behavior. UI work remains in Phase 4.

@@ -350,6 +350,75 @@ def test_scanning_a_missing_mountpoint_raises_card_error(tmp_path):
         in_scope_files(tmp_path / "not-mounted")
 
 
+def test_appledouble_sidecars_are_not_in_scope(card):
+    """A card read on a Mac comes back with `._name.csv` resource forks.
+
+    They are metadata, not flight data, and match every other rule, so only
+    the dotfile check keeps them out of the ledger.
+    """
+    write_card_file(card, "log_20260202_125908_KPIH.csv")
+    write_card_file(card, "._log_20260202_125908_KPIH.csv")
+    write_card_file(card, ".DS_Store.csv")
+
+    assert in_scope_files(card) == ["log_20260202_125908_KPIH.csv"]
+
+
+# --- Scan subdirectory --------------------------------------------------------
+
+
+def test_scan_root_defaults_to_the_card_root(config):
+    assert config.scan_root == config.card_mountpoint
+
+
+def test_scan_root_descends_into_the_configured_subdirectory(config):
+    scoped = replace(config, card_scan_subdir="data_log")
+    assert scoped.scan_root == config.card_mountpoint / "data_log"
+
+
+def test_only_the_configured_subdirectory_is_scanned(config, card):
+    """Garmin cards keep logs under `data_log/` and junk at the root."""
+    (card / "data_log").mkdir()
+    write_card_file(card, "data_log/log_20260202_125908_KPIH.csv")
+    write_card_file(card, "data_log/._log_20260202_125908_KPIH.csv")
+    write_card_file(card, "root-level.csv")
+
+    scoped = replace(config, card_scan_subdir="data_log")
+
+    assert in_scope_files(scoped.scan_root) == ["log_20260202_125908_KPIH.csv"]
+
+
+def test_a_missing_scan_subdirectory_raises_card_error(config):
+    scoped = replace(config, card_scan_subdir="data_log")
+    with pytest.raises(CardError):
+        in_scope_files(scoped.scan_root)
+
+
+def test_scan_subdir_defaults_to_empty_when_unset():
+    assert sdcard_watcher.resolve_card_scan_subdir({}) == ""
+    assert sdcard_watcher.resolve_card_scan_subdir({"CARD_SCAN_SUBDIR": "  "}) == ""
+
+
+def test_scan_subdir_strips_surrounding_slashes():
+    assert sdcard_watcher.resolve_card_scan_subdir(
+        {"CARD_SCAN_SUBDIR": "/data_log/"}
+    ) == "data_log"
+
+
+def test_scan_subdir_accepts_a_nested_relative_path():
+    assert sdcard_watcher.resolve_card_scan_subdir(
+        {"CARD_SCAN_SUBDIR": "Garmin/data_log"}
+    ) == "Garmin/data_log"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["..", "../outside", "data_log/../..", ".", "data\\log", "data_log\x00"],
+)
+def test_scan_subdir_refuses_to_escape_the_card(value):
+    with pytest.raises(ConfigError):
+        sdcard_watcher.resolve_card_scan_subdir({"CARD_SCAN_SUBDIR": value})
+
+
 # --- Offline queueing ---------------------------------------------------------
 
 
@@ -431,6 +500,27 @@ def test_a_file_one_byte_over_the_limit_is_rejected_and_not_queued(
     assert (result.copied, result.rejected) == (0, 1)
     assert queued_cards(config) == []
     assert ledger.known_filenames(CARD_A) == set()
+
+
+def test_files_in_the_scan_subdirectory_are_copied_into_the_queue(
+    ready, card, ledger, watcher_logger, mounted
+):
+    """End to end for a Garmin-shaped card: logs nested, junk at the root."""
+    mounted(MOUNTED_A)
+    (card / "data_log").mkdir()
+    write_card_file(card, "data_log/log_20260202_125908_KPIH.csv", b"x" * 10)
+    write_card_file(card, "data_log/._log_20260202_125908_KPIH.csv", b"junk")
+    write_card_file(card, "safetaxi.csv", b"x" * 10)
+    config = replace(ready, card_scan_subdir="data_log")
+
+    result = ingest_card(config, ledger, watcher_logger, MOUNTED_A)
+
+    assert result.copied == 1
+    assert queued(config) == ["log_20260202_125908_KPIH.csv"]
+    assert (
+        config.pending_dir_for(CARD_A) / "log_20260202_125908_KPIH.csv"
+    ).stat().st_size == 10
+    assert ledger.known_filenames(CARD_A) == {"log_20260202_125908_KPIH.csv"}
 
 
 def test_an_unsafe_filename_is_rejected_and_not_queued(

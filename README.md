@@ -281,8 +281,9 @@ From the repository root, start it:
 ```
 
 Open <http://127.0.0.1:8765>. Use **Refresh** to reload the latest 50 pings and
-uploads, newest first. Use **Preview** beside an upload to show its first 100
-CSV records. To choose another local port:
+uploads, newest first. Upload rows include the card UUID so same-named files
+from different cards remain distinguishable. Use **Preview** beside an upload
+to show its card UUID and first 100 CSV records. To choose another local port:
 
 ```bash
 .venv/bin/python tools/railway_viewer.py --port 9000
@@ -539,9 +540,14 @@ lsblk -o PATH,TYPE,RM,HOTPLUG,FSTYPE,UUID,MOUNTPOINTS   # what the mounter sees
   boundary, then finds which `/dev/disk/by-uuid` entry matches the mounted
   device. No UUID is configured anywhere. If nothing safe resolves, it stays in
   `card_absent`/`card_not_mounted` and writes nothing.
-- Scans **root-level regular `.csv` files only**. Directories, symlinks,
-  non-CSV files, and nested paths are ignored; symlinks are never followed off
-  the card.
+- Scans **regular `.csv` files one level deep only**, in `CARD_SCAN_SUBDIR` if
+  set or the card root otherwise. Directories, symlinks, non-CSV files, dotfiles,
+  and deeper paths are ignored; symlinks are never followed off the card. Garmin
+  avionics cards keep their flight logs under `data_log/`, so they need
+  `CARD_SCAN_SUBDIR=data_log`.
+- Ignores **dotfiles**, which keeps macOS AppleDouble sidecars (`._log_1.csv`
+  beside `log_1.csv`) out of the ledger. A card that has been read on a Mac
+  carries them, and they match every other rule.
 - Skips any filename already `pending` or `uploaded` **for that card**. Another
   card's identical filename is a different file and is still copied.
 - Copies to `queue/tmp/`, fsyncs, re-checks that the same card is still mounted,
