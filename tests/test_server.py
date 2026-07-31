@@ -776,6 +776,20 @@ def test_startup_refuses_a_phase_2_uploads_table(settings, db_path, uploads_path
             pass
 
 
+def test_a_refused_startup_says_why_in_the_log(settings, db_path, uploads_path, caplog):
+    """A platform healthcheck only reports "never became healthy", so the
+    reason has to be findable in the deploy log without reading a traceback."""
+    make_legacy_volume(db_path, uploads_path)
+
+    with caplog.at_level("CRITICAL", logger="piserver"):
+        with pytest.raises(RuntimeError):
+            with TestClient(create_app(settings)):
+                pass
+
+    assert "REFUSING TO START" in caplog.text
+    assert "PHASE3_RESET_UPLOADS=1" in caplog.text
+
+
 def test_a_refused_startup_destroys_nothing(settings, db_path, uploads_path):
     legacy_blob = make_legacy_volume(db_path, uploads_path)
 

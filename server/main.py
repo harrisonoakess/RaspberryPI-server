@@ -380,12 +380,17 @@ def initialize_storage(settings: Settings) -> None:
 
     if uploads_schema_state(settings.database_path) == UPLOADS_SCHEMA_LEGACY:
         if not settings.reset_uploads:
-            raise RuntimeError(
+            message = (
                 "the uploads table is still on the Phase 2 schema (no card_uuid "
                 "column). Phase 3 cannot read it. Set PHASE3_RESET_UPLOADS=1 to "
                 "drop the uploads table and clear stored blobs; ping rows are "
                 "kept. This deletes every Phase 2 upload permanently."
             )
+            # Logged as well as raised: a refused start shows up in a platform
+            # healthcheck only as "never became healthy", and the traceback is
+            # easy to miss in a deploy log. This line is the one to read.
+            logger.critical("REFUSING TO START: %s", message)
+            raise RuntimeError(message)
         reset_uploads_state(settings)
 
     initialize_database(settings.database_path)
