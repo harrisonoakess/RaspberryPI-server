@@ -104,7 +104,8 @@ prd/                          phase PRDs
 | `GET /dashboard/api/session` | session cookie | `200 {"authenticated":true,"expires_at":…}` | `401` missing/expired/tampered |
 | `DELETE /dashboard/api/session` | none | `204`, always | — |
 | `GET /dashboard/api/status` | session cookie | `200 {"status":"online"\|"offline"\|"never_seen",…}` | `401`, `503` cannot read |
-| `GET /dashboard/api/uploads` | session cookie | `200 {"items":[…],"next_before_id":…}` | `401`, `422` bad `limit`/`before_id`, `503` cannot read |
+| `GET /dashboard/api/uploads` | session cookie | `200 {"items":[…],"total":…,"limit":…,"offset":…,"sort":…,"order":…}` | `401`, `422` unknown/repeated/invalid parameter, `503` cannot read |
+| `GET /dashboard/api/uploads/summary` | session cookie | `200 {"total_files":…,"total_bytes":…,"cards":[…],"all_card_uuids":[…],…}` | `401`, `422` unknown/repeated/invalid parameter, `503` cannot read |
 | `GET /dashboard/api/uploads/{id}/preview` | session cookie | `200 {"upload_id":…,"filename":…,"card_uuid":…,"records":[[…]],"truncated":…}` | `401`, `404` unknown id, `409` file missing/out of root, `422` bad id or unreadable CSV, `503` cannot read |
 
 The dashboard endpoints never accept the ingest `API_KEY`, and the ingest
@@ -441,9 +442,27 @@ says **unavailable** rather than offline: a server fault is not the Pi's fault.
 
 ### Browsing and previewing
 
-The uploads table lists every stored file newest first, with its card UUID, so
-two `logger-0001.csv` files from two different physical cards stay
-distinguishable. **Load more** pages through the rest.
+The uploads panel opens on every stored file, newest first, with its card UUID,
+so two `logger-0001.csv` files from two different physical cards stay
+distinguishable. Above the table, four tiles give the file count, total size,
+card count, and device count.
+
+**Sorting and filtering happen on the server, not in the browser.** Sorting by
+size orders every stored row, not just the page on screen, and the count in the
+tiles is the count of matching rows rather than of loaded ones.
+
+- **Sort** by clicking any column header. Clicking the active column reverses
+  it. Names start A→Z; sizes and timestamps start largest/newest first.
+- **Search** filters on the filename as a literal substring — `%` and `_` match
+  themselves rather than acting as wildcards. **Card** and **Device** narrow to
+  one value each, and always keep offering every stored value so a filter can be
+  widened again. **Clear filters** resets all three.
+- **Files** / **By card** switches between the flat list and per-card rollups.
+  A card group shows its file count, total size, and last activity; opening one
+  lists that card's files (up to 100 — use the Files view to page past that).
+  Cards past the 200 most recently active are not grouped, and the view says so.
+- **Previous** / **Next** page through the flat list 50 rows at a time. Changing
+  a sort or a filter returns to the first page.
 
 **Preview** opens the first records of a file as raw CSV cells. It shows at most
 100 records and about 1 MB of cell content, and says so when it truncates. Empty
@@ -463,14 +482,22 @@ production build after deploying, at a desktop width and again at a phone width
    time. Confirm the Pi's next heartbeat lands within one 60-second refresh.
 4. Upload a CSV from the Pi (or with the receipt-check `curl` above) and confirm
    the new row appears after **Refresh**, with the right card UUID and size.
-5. Open **Preview**, check the records against the source file, close with
+5. Sort by **Size**, then page to the last page: the smallest file is there, not
+   merely the smallest of the first page. Reverse the sort and confirm the page
+   returns to the first.
+6. Type a partial filename into **Search**: the table and the **Files matched**
+   tile narrow together. Pick a **Card**, confirm the card list still offers
+   every card, then **Clear filters**.
+7. Switch to **By card**, open a group, and check its file count against the
+   rows it lists.
+8. Open **Preview**, check the records against the source file, close with
    `Esc`, and confirm focus returns to the button that opened it.
-6. Open a different file's preview and confirm none of the previous file's rows
+9. Open a different file's preview and confirm none of the previous file's rows
    are shown.
-7. Tab through the page: every control is reachable and has a visible focus
-   ring. The page itself never scrolls sideways — wide tables scroll inside
-   their own container.
-8. Sign out and confirm the dashboard is gone and the password form is back.
+10. Tab through the page: every control is reachable and has a visible focus
+    ring, including the column-header sort buttons. The page itself never
+    scrolls sideways — wide tables scroll inside their own container.
+11. Sign out and confirm the dashboard is gone and the password form is back.
 
 ## Phase 2 → Phase 3 rollout (one time)
 

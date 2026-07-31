@@ -1,10 +1,49 @@
-import { useCallback, useEffect, useState } from "react";
+/** The volume browser: totals, filters, and either a flat file list or per-card groups.
+ *
+ * Sorting and filtering are the server's job, so what the table shows is the
+ * whole stored set narrowed — never just the rows a previous page happened to
+ * have fetched. That is also why the query is one piece of state: changing a
+ * filter or a sort has to reset the page in the same update, or the first
+ * request after the change would ask for a page that no longer exists.
+ */
 
-import { UnauthorizedError, listUploads, type UploadItem } from "../api";
-import { formatBytes } from "../format";
-import { PreviewDialog } from "./PreviewDialog";
-import { Timestamp } from "./Timestamp";
+import { useCallback, useEffect, useMemo, useState } from "react";
+
+import {
+  NO_FILTERS,
+  UnauthorizedError,
+  getUploadSummary,
+  listUploads,
+  type SortKey,
+  type SortOrder,
+  type UploadFilters,
+  type UploadPage,
+  type UploadSummary,
+} from "../api";
+import { CardGroups } from "./CardGroups";
+import { UploadsSummaryBar } from "./UploadsSummary";
+import { UploadsTable, defaultOrderFor } from "./UploadsTable";
+import { UploadsToolbar, type ViewMode } from "./UploadsToolbar";
 import styles from "./UploadsPanel.module.css";
+
+const PAGE_SIZE = 50;
+
+/** Long enough that ordinary typing sends one request, short enough to feel live. */
+const SEARCH_DEBOUNCE_MS = 250;
+
+interface UploadsQuery {
+  filters: UploadFilters;
+  sort: SortKey;
+  order: SortOrder;
+  offset: number;
+}
+
+const INITIAL_QUERY: UploadsQuery = {
+  filters: NO_FILTERS,
+  sort: "received_at",
+  order: "desc",
+  offset: 0,
+};
 
 interface UploadsPanelProps {
   reloadToken: number;
@@ -12,50 +51,138 @@ interface UploadsPanelProps {
 }
 
 export function UploadsPanel({ reloadToken, onUnauthorized }: UploadsPanelProps) {
-  const [items, setItems] = useState<UploadItem[]>([]);
-  const [cursor, setCursor] = useState<number | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [loaded, setLoaded] = useState(false);
+  const [view, setView] = useState<ViewMode>("files");
+  const [query, setQuery] = useState<UploadsQuery>(INITIAL_QUERY);
 
-  const load = useCallback(
-    async (beforeId: number | null) => {
-      setLoading(true);
-      setError(null);
+  // The text box updates on every keystroke; `query.filters.q` lags behind it by
+  // the debounce, and is the value actually sent.
+  const [searchText, setSearchText] = useState("");
+
+  const [page, setPage] = useState<UploadPage | null>(null);
+  const [pageError, setPageError] = useState<string | null>(null);
+  const [pageLoading, setPageLoading] = useState(true);
+
+  const [summary, setSummary] = useState<UploadSummary | null>(null);
+  const [summaryError, setSummaryError] = useState<string | null>(null);
+
+  const { filters, sort, order, offset } = query;
+  const filtered = filters.q !== "" || filters.cardUuid !== "" || filters.deviceId !== "";
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setQuery((current) =>
+        current.filters.q === searchText
+          ? current
+          : { ...current, filters: { ...current.filters, q: searchText }, offset: 0 },
+      );
+    }, SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [searchText]);
+
+  // Totals are wanted in both views: the flat list shows them above the table,
+  // and the grouped view is built from the same response's card rollups.
+  useEffect(() => {
+    let cancelled = false;
+    setSummaryError(null);
+    void (async () => {
       try {
-        const page = await listUploads(beforeId);
-        setItems((current) => {
-          if (beforeId === null) {
-            return page.items;
-          }
-          // Appending by cursor cannot duplicate, but a repeated click while a
-          // request is in flight could; filtering by id makes that impossible.
-          const known = new Set(current.map((item) => item.id));
-          return [...current, ...page.items.filter((item) => !known.has(item.id))];
-        });
-        setCursor(page.next_before_id);
-        setLoaded(true);
+        const next = await getUploadSummary(filters);
+        if (!cancelled) {
+          setSummary(next);
+        }
       } catch (caught) {
+        if (cancelled) return;
         if (caught instanceof UnauthorizedError) {
           onUnauthorized();
           return;
         }
-        setError("Could not load uploads.");
-      } finally {
-        setLoading(false);
+        setSummaryError("Could not load upload totals.");
       }
-    },
-    [onUnauthorized],
-  );
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [filters, reloadToken, onUnauthorized]);
 
   useEffect(() => {
-    setItems([]);
-    setCursor(null);
-    setLoaded(false);
-    void load(null);
-  }, [load, reloadToken]);
+    if (view !== "files") {
+      return;
+    }
+    let cancelled = false;
+    setPageLoading(true);
+    setPageError(null);
+    void (async () => {
+      try {
+        const next = await listUploads({ ...filters, sort, order, limit: PAGE_SIZE, offset });
+        if (!cancelled) {
+          setPage(next);
+        }
+      } catch (caught) {
+        if (cancelled) return;
+        if (caught instanceof UnauthorizedError) {
+          onUnauthorized();
+          return;
+        }
+        setPageError("Could not load uploads.");
+      } finally {
+        if (!cancelled) {
+          setPageLoading(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [filters, sort, order, offset, view, reloadToken, onUnauthorized]);
 
-  const empty = loaded && items.length === 0;
+  // A refresh must not leave a stale page of a filter that no longer applies.
+  useEffect(() => {
+    setPage(null);
+  }, [reloadToken]);
+
+  const handleFilter = useCallback((patch: Partial<UploadFilters>) => {
+    setQuery((current) => ({
+      ...current,
+      filters: { ...current.filters, ...patch },
+      offset: 0,
+    }));
+  }, []);
+
+  const handleClear = useCallback(() => {
+    setSearchText("");
+    setQuery((current) => ({ ...current, filters: NO_FILTERS, offset: 0 }));
+  }, []);
+
+  const handleSort = useCallback((key: SortKey) => {
+    setQuery((current) => ({
+      ...current,
+      sort: key,
+      // Re-clicking the active column reverses it; a new column starts in the
+      // direction that column is usually read in.
+      order:
+        current.sort === key
+          ? current.order === "asc"
+            ? "desc"
+            : "asc"
+          : defaultOrderFor(key),
+      offset: 0,
+    }));
+  }, []);
+
+  const goTo = useCallback((nextOffset: number) => {
+    setQuery((current) => ({ ...current, offset: Math.max(0, nextOffset) }));
+  }, []);
+
+  const caption = useMemo(() => {
+    if (page === null || page.total === 0) {
+      return "Stored uploads.";
+    }
+    const first = page.offset + 1;
+    const last = page.offset + page.items.length;
+    return `Stored uploads ${first}–${last} of ${page.total}.`;
+  }, [page]);
+
+  const empty = page !== null && page.total === 0 && !pageLoading;
 
   return (
     <section className={styles.panel} aria-labelledby="uploads-heading">
@@ -63,70 +190,110 @@ export function UploadsPanel({ reloadToken, onUnauthorized }: UploadsPanelProps)
         Uploads
       </h2>
 
-      {error !== null && (
-        <p className={styles.error} role="alert">
-          {error}
-        </p>
-      )}
+      <UploadsSummaryBar summary={summary} filtered={filtered} error={summaryError} />
 
-      {loading && items.length === 0 && error === null && (
-        <p className={styles.state}>Loading uploads…</p>
-      )}
+      <UploadsToolbar
+        searchText={searchText}
+        onSearchText={setSearchText}
+        filters={filters}
+        onFilter={handleFilter}
+        onClear={handleClear}
+        cardOptions={summary?.all_card_uuids ?? []}
+        deviceOptions={summary?.all_device_ids ?? []}
+        view={view}
+        onView={setView}
+        filtered={filtered}
+      />
 
-      {empty && error === null && (
-        <p className={styles.state}>No uploads have been stored yet.</p>
-      )}
+      {view === "cards" ? (
+        summary === null ? (
+          <p className={styles.state}>Loading cards…</p>
+        ) : (
+          <CardGroups
+            summary={summary}
+            search={filters.q}
+            sort={sort}
+            order={order}
+            onSort={handleSort}
+            onUnauthorized={onUnauthorized}
+          />
+        )
+      ) : (
+        <>
+          {pageError !== null && (
+            <p className={styles.error} role="alert">
+              {pageError}
+            </p>
+          )}
 
-      {items.length > 0 && (
-        <div className={styles.tableScroll}>
-          <table className={styles.table}>
-            <caption className={styles.caption}>
-              Stored uploads, newest first. {items.length} shown.
-            </caption>
-            <thead>
-              <tr>
-                <th scope="col">File</th>
-                <th scope="col">Card UUID</th>
-                <th scope="col">Device</th>
-                <th scope="col">Size</th>
-                <th scope="col">Received</th>
-                <th scope="col">
-                  <span className={styles.visuallyHidden}>Actions</span>
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {items.map((item) => (
-                <tr key={item.id}>
-                  <th scope="row" className={styles.filename}>
-                    {item.filename}
-                  </th>
-                  <td className={styles.mono}>{item.card_uuid}</td>
-                  <td>{item.device_id}</td>
-                  <td className={styles.numeric}>{formatBytes(item.size)}</td>
-                  <td>
-                    <Timestamp utc={item.received_at} />
-                  </td>
-                  <td>
-                    <PreviewDialog upload={item} onUnauthorized={onUnauthorized} />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
+          {pageLoading && page === null && pageError === null && (
+            <p className={styles.state}>Loading uploads…</p>
+          )}
 
-      {cursor !== null && (
-        <button
-          type="button"
-          className={styles.loadMore}
-          onClick={() => void load(cursor)}
-          disabled={loading}
-        >
-          {loading ? "Loading…" : "Load more"}
-        </button>
+          {empty && pageError === null && (
+            <p className={styles.state}>
+              {filtered
+                ? "No uploads match the current filters."
+                : "No uploads have been stored yet."}
+            </p>
+          )}
+
+          {page !== null && page.items.length > 0 && (
+            <>
+              <UploadsTable
+                items={page.items}
+                sort={sort}
+                order={order}
+                onSort={handleSort}
+                onUnauthorized={onUnauthorized}
+                caption={caption}
+              />
+              <Pager page={page} loading={pageLoading} onGoTo={goTo} />
+            </>
+          )}
+        </>
       )}
     </section>
+  );
+}
+
+interface PagerProps {
+  page: UploadPage;
+  loading: boolean;
+  onGoTo: (offset: number) => void;
+}
+
+function Pager({ page, loading, onGoTo }: PagerProps) {
+  const hasPrevious = page.offset > 0;
+  const hasNext = page.offset + page.items.length < page.total;
+  if (!hasPrevious && !hasNext) {
+    return null;
+  }
+
+  const pageNumber = Math.floor(page.offset / page.limit) + 1;
+  const pageCount = Math.max(1, Math.ceil(page.total / page.limit));
+
+  return (
+    <nav className={styles.pager} aria-label="Upload pages">
+      <button
+        type="button"
+        className={styles.pageButton}
+        onClick={() => onGoTo(page.offset - page.limit)}
+        disabled={!hasPrevious || loading}
+      >
+        Previous
+      </button>
+      <span className={styles.pageStatus}>
+        Page {pageNumber} of {pageCount}
+      </span>
+      <button
+        type="button"
+        className={styles.pageButton}
+        onClick={() => onGoTo(page.offset + page.limit)}
+        disabled={!hasNext || loading}
+      >
+        Next
+      </button>
+    </nav>
   );
 }

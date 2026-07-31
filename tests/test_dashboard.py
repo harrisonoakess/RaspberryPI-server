@@ -44,6 +44,7 @@ PROTECTED_ENDPOINTS = (
     "/dashboard/api/session",
     "/dashboard/api/status",
     "/dashboard/api/uploads",
+    "/dashboard/api/uploads/summary",
     "/dashboard/api/uploads/1/preview",
 )
 
@@ -520,8 +521,14 @@ def test_an_unparseable_stored_timestamp_is_unavailable_not_offline(signed_in, d
 
 
 def test_uploads_are_returned_newest_first_with_card_identity(signed_in, db_path, uploads_path):
-    insert_upload(db_path, uploads_path, "logger-0001.csv", card_uuid=CARD_A)
-    second = insert_upload(db_path, uploads_path, "logger-0001.csv", card_uuid=CARD_B)
+    insert_upload(
+        db_path, uploads_path, "logger-0001.csv", card_uuid=CARD_A,
+        received_at="2026-07-31T14:01:00Z",
+    )
+    second = insert_upload(
+        db_path, uploads_path, "logger-0001.csv", card_uuid=CARD_B,
+        received_at="2026-07-31T14:02:00Z",
+    )
 
     body = signed_in.get("/dashboard/api/uploads").json()
 
@@ -530,7 +537,12 @@ def test_uploads_are_returned_newest_first_with_card_identity(signed_in, db_path
     assert body["items"][0]["device_id"] == DEVICE
     assert body["items"][0]["filename"] == "logger-0001.csv"
     assert body["items"][0]["received_at"] == "2026-07-31T14:02:00Z"
-    assert body["next_before_id"] is None
+    assert (body["total"], body["offset"], body["sort"], body["order"]) == (
+        2,
+        0,
+        "received_at",
+        "desc",
+    )
 
 
 def test_upload_rows_never_expose_the_stored_path(signed_in, db_path, uploads_path):
@@ -544,47 +556,158 @@ def test_upload_rows_never_expose_the_stored_path(signed_in, db_path, uploads_pa
 def test_an_empty_database_returns_an_empty_page(signed_in):
     assert signed_in.get("/dashboard/api/uploads").json() == {
         "items": [],
-        "next_before_id": None,
+        "total": 0,
+        "limit": 50,
+        "offset": 0,
+        "sort": "received_at",
+        "order": "desc",
     }
 
 
-def test_cursor_pagination_returns_every_row_exactly_once(signed_in, db_path, uploads_path):
+# --- Sorting -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("sort", "order", "expected"),
+    [
+        ("filename", "asc", ["a.csv", "B.csv", "c.csv"]),
+        ("filename", "desc", ["c.csv", "B.csv", "a.csv"]),
+        ("size", "asc", ["c.csv", "a.csv", "B.csv"]),
+        ("size", "desc", ["B.csv", "a.csv", "c.csv"]),
+        ("received_at", "asc", ["B.csv", "c.csv", "a.csv"]),
+        ("received_at", "desc", ["a.csv", "c.csv", "B.csv"]),
+    ],
+)
+def test_every_sortable_column_orders_both_ways(
+    signed_in, db_path, uploads_path, sort, order, expected
+):
+    # Deliberately mixed case: filename sorting must not put every capital
+    # ahead of every lowercase name the way a byte-wise sort would.
+    insert_upload(
+        db_path, uploads_path, "a.csv", content=b"xx", received_at="2026-07-31T14:03:00Z"
+    )
+    insert_upload(
+        db_path, uploads_path, "B.csv", content=b"xxx", received_at="2026-07-31T14:01:00Z"
+    )
+    insert_upload(
+        db_path, uploads_path, "c.csv", content=b"x", received_at="2026-07-31T14:02:00Z"
+    )
+
+    body = signed_in.get(
+        "/dashboard/api/uploads", params={"sort": sort, "order": order}
+    ).json()
+
+    assert [item["filename"] for item in body["items"]] == expected
+    assert body["sort"] == sort and body["order"] == order
+
+
+def test_offset_pagination_returns_every_row_exactly_once(signed_in, db_path, uploads_path):
     expected = [
         insert_upload(db_path, uploads_path, f"logger-{index:04d}.csv") for index in range(7)
     ]
 
     seen = []
-    cursor = None
-    for _ in range(10):
-        query = {"limit": "3"}
-        if cursor is not None:
-            query["before_id"] = str(cursor)
-        body = signed_in.get("/dashboard/api/uploads", params=query).json()
+    for offset in range(0, 9, 3):
+        body = signed_in.get(
+            "/dashboard/api/uploads", params={"limit": "3", "offset": str(offset)}
+        ).json()
+        assert body["total"] == len(expected)
         seen.extend(item["id"] for item in body["items"])
-        cursor = body["next_before_id"]
-        if cursor is None:
-            break
 
-    assert cursor is None
-    assert seen == sorted(expected, reverse=True)
+    assert sorted(seen) == sorted(expected)
     assert len(seen) == len(set(seen))
 
 
-def test_next_cursor_is_the_last_returned_id_when_more_rows_exist(
+def test_tied_sort_values_are_broken_by_id_so_pages_never_overlap(
     signed_in, db_path, uploads_path
 ):
-    for index in range(4):
+    """Every row here has the same size and timestamp; only `id` separates them."""
+    for index in range(6):
         insert_upload(db_path, uploads_path, f"logger-{index:04d}.csv")
 
-    body = signed_in.get("/dashboard/api/uploads", params={"limit": "2"}).json()
-    assert body["next_before_id"] == body["items"][-1]["id"]
+    seen = []
+    for offset in (0, 2, 4):
+        body = signed_in.get(
+            "/dashboard/api/uploads",
+            params={"sort": "size", "order": "asc", "limit": "2", "offset": str(offset)},
+        ).json()
+        seen.extend(item["id"] for item in body["items"])
 
-    # A page that exactly drains the remaining rows reports no further page.
-    final = signed_in.get(
-        "/dashboard/api/uploads", params={"limit": "2", "before_id": str(body["next_before_id"])}
+    assert len(seen) == len(set(seen)) == 6
+
+
+def test_an_offset_past_the_end_is_an_empty_page_not_an_error(
+    signed_in, db_path, uploads_path
+):
+    insert_upload(db_path, uploads_path, "logger-0001.csv")
+    body = signed_in.get("/dashboard/api/uploads", params={"offset": "100"}).json()
+
+    assert body["items"] == []
+    assert body["total"] == 1
+
+
+# --- Filtering ---------------------------------------------------------------
+
+
+def test_filename_search_narrows_the_page_and_the_total(signed_in, db_path, uploads_path):
+    insert_upload(db_path, uploads_path, "logger-0001.csv")
+    insert_upload(db_path, uploads_path, "logger-0002.csv")
+    insert_upload(db_path, uploads_path, "notes.txt")
+
+    body = signed_in.get("/dashboard/api/uploads", params={"q": "logger"}).json()
+
+    assert body["total"] == 2
+    assert {item["filename"] for item in body["items"]} == {
+        "logger-0001.csv",
+        "logger-0002.csv",
+    }
+
+
+def test_search_is_case_insensitive_and_matches_anywhere_in_the_name(
+    signed_in, db_path, uploads_path
+):
+    insert_upload(db_path, uploads_path, "Logger-0001.csv")
+    assert signed_in.get("/dashboard/api/uploads", params={"q": "LOG"}).json()["total"] == 1
+    assert signed_in.get("/dashboard/api/uploads", params={"q": "0001"}).json()["total"] == 1
+
+
+@pytest.mark.parametrize("needle", ["log_er", "%", "_", "logg%r"])
+def test_like_wildcards_in_a_search_are_matched_literally(
+    signed_in, db_path, uploads_path, needle
+):
+    """An unescaped `%` or `_` would turn a narrow search into "everything"."""
+    insert_upload(db_path, uploads_path, "logger-0001.csv")
+    assert signed_in.get("/dashboard/api/uploads", params={"q": needle}).json()["total"] == 0
+
+
+def test_a_whitespace_only_search_is_no_search_at_all(signed_in, db_path, uploads_path):
+    insert_upload(db_path, uploads_path, "logger-0001.csv")
+    assert signed_in.get("/dashboard/api/uploads", params={"q": "   "}).json()["total"] == 1
+
+
+def test_filters_select_a_single_card_and_device(signed_in, db_path, uploads_path):
+    insert_upload(db_path, uploads_path, "logger-0001.csv", card_uuid=CARD_A)
+    insert_upload(db_path, uploads_path, "logger-0002.csv", card_uuid=CARD_A)
+    insert_upload(db_path, uploads_path, "logger-0001.csv", card_uuid=CARD_B)
+    insert_upload(
+        db_path, uploads_path, "logger-0001.csv", card_uuid=CARD_A, device_id="other-pi"
+    )
+
+    by_card = signed_in.get("/dashboard/api/uploads", params={"card_uuid": CARD_A}).json()
+    assert by_card["total"] == 3
+    assert {item["card_uuid"] for item in by_card["items"]} == {CARD_A}
+
+    by_device = signed_in.get("/dashboard/api/uploads", params={"device_id": DEVICE}).json()
+    assert by_device["total"] == 3
+
+    # The two filters intersect rather than widening each other.
+    both = signed_in.get(
+        "/dashboard/api/uploads", params={"card_uuid": CARD_A, "device_id": "other-pi"}
     ).json()
-    assert len(final["items"]) == 2
-    assert final["next_before_id"] is None
+    assert both["total"] == 1
+
+
+# --- Parameter validation ----------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -598,23 +721,43 @@ def test_next_cursor_is_the_last_returned_id_when_more_rows_exist(
         "limit=+5",
         "limit=",
         "limit=5&limit=6",
-        "before_id=0",
-        "before_id=-3",
-        "before_id=abc",
-        "before_id=01",
-        "before_id=1&before_id=2",
-        "offset=5",
-        "device_id=raspberrypi-uploader",
+        "offset=-1",
+        "offset=abc",
+        "offset=01",
+        "offset=",
+        "offset=1&offset=2",
+        "sort=stored_path",
+        "sort=id",
+        "sort=size%3B+DROP+TABLE+uploads",
+        "sort=",
+        "sort=size&sort=filename",
+        "order=ascending",
+        "order=ASC",
+        "order=",
+        "order=asc&order=desc",
+        "card_uuid=not+a+uuid",
+        "card_uuid=1234-ABCD&card_uuid=5678-EF01",
+        "device_id=not+a+device",
+        "q=a&q=b",
+        "before_id=1",
+        "unknown=1",
     ],
 )
-def test_malformed_pagination_parameters_are_rejected(signed_in, query):
+def test_malformed_list_parameters_are_rejected(signed_in, query):
     assert signed_in.get(f"/dashboard/api/uploads?{query}").status_code == 422
+
+
+def test_an_overlong_search_is_rejected(signed_in):
+    long_needle = "a" * (dashboard.MAX_SEARCH_CHARACTERS + 1)
+    response = signed_in.get("/dashboard/api/uploads", params={"q": long_needle})
+    assert response.status_code == 422
 
 
 def test_limit_boundaries_are_accepted(signed_in, db_path, uploads_path):
     insert_upload(db_path, uploads_path, "logger-0001.csv")
     assert signed_in.get("/dashboard/api/uploads", params={"limit": "1"}).status_code == 200
     assert signed_in.get("/dashboard/api/uploads", params={"limit": "100"}).status_code == 200
+    assert signed_in.get("/dashboard/api/uploads", params={"offset": "0"}).status_code == 200
 
 
 def test_upload_list_reports_a_database_failure_as_unavailable(signed_in, monkeypatch):
@@ -633,6 +776,140 @@ def test_upload_list_rejects_an_unrenderable_stored_timestamp(
 ):
     insert_upload(db_path, uploads_path, "logger-0001.csv", received_at="yesterday")
     assert signed_in.get("/dashboard/api/uploads").status_code == 503
+
+
+# --- Summary and per-card rollups --------------------------------------------
+
+
+def test_summary_totals_and_per_card_rollups(signed_in, db_path, uploads_path):
+    insert_upload(
+        db_path, uploads_path, "logger-0001.csv", card_uuid=CARD_A, content=b"aa",
+        received_at="2026-07-31T14:01:00Z",
+    )
+    insert_upload(
+        db_path, uploads_path, "logger-0002.csv", card_uuid=CARD_A, content=b"bbb",
+        received_at="2026-07-31T14:03:00Z",
+    )
+    insert_upload(
+        db_path, uploads_path, "logger-0001.csv", card_uuid=CARD_B, content=b"c",
+        received_at="2026-07-31T14:02:00Z",
+    )
+
+    body = signed_in.get("/dashboard/api/uploads/summary").json()
+
+    assert body["total_files"] == 3
+    assert body["total_bytes"] == 6
+    assert body["card_count"] == 2
+    assert body["device_count"] == 1
+    assert body["oldest_received_at"] == "2026-07-31T14:01:00Z"
+    assert body["newest_received_at"] == "2026-07-31T14:03:00Z"
+    assert body["cards_truncated"] is False
+
+    # Most recently active card first.
+    assert [card["card_uuid"] for card in body["cards"]] == [CARD_A, CARD_B]
+    first = body["cards"][0]
+    assert (first["file_count"], first["total_bytes"]) == (2, 5)
+    assert first["oldest_received_at"] == "2026-07-31T14:01:00Z"
+    assert first["newest_received_at"] == "2026-07-31T14:03:00Z"
+    assert first["device_id"] == DEVICE
+
+
+def test_the_same_card_on_two_devices_is_two_rollups(signed_in, db_path, uploads_path):
+    insert_upload(db_path, uploads_path, "logger-0001.csv", card_uuid=CARD_A)
+    insert_upload(
+        db_path, uploads_path, "logger-0001.csv", card_uuid=CARD_A, device_id="other-pi"
+    )
+
+    body = signed_in.get("/dashboard/api/uploads/summary").json()
+
+    assert body["card_count"] == 2
+    assert body["device_count"] == 2
+    assert len(body["cards"]) == 2
+    assert {card["device_id"] for card in body["cards"]} == {DEVICE, "other-pi"}
+
+
+def test_summary_totals_follow_the_active_filters(signed_in, db_path, uploads_path):
+    insert_upload(db_path, uploads_path, "logger-0001.csv", card_uuid=CARD_A, content=b"aa")
+    insert_upload(db_path, uploads_path, "notes.txt", card_uuid=CARD_B, content=b"bbbb")
+
+    body = signed_in.get("/dashboard/api/uploads/summary", params={"q": "logger"}).json()
+
+    assert body["total_files"] == 1
+    assert body["total_bytes"] == 2
+    assert [card["card_uuid"] for card in body["cards"]] == [CARD_A]
+
+
+def test_filter_choices_are_never_narrowed_by_the_active_filter(
+    signed_in, db_path, uploads_path
+):
+    """Otherwise the control would only ever offer the value already chosen."""
+    insert_upload(db_path, uploads_path, "logger-0001.csv", card_uuid=CARD_A)
+    insert_upload(
+        db_path, uploads_path, "logger-0001.csv", card_uuid=CARD_B, device_id="other-pi"
+    )
+
+    body = signed_in.get(
+        "/dashboard/api/uploads/summary", params={"card_uuid": CARD_A}
+    ).json()
+
+    assert body["total_files"] == 1
+    assert body["all_card_uuids"] == [CARD_A, CARD_B]
+    assert body["all_device_ids"] == ["other-pi", DEVICE]
+
+
+def test_summary_of_an_empty_database_reports_zeroes_not_null_totals(signed_in):
+    assert signed_in.get("/dashboard/api/uploads/summary").json() == {
+        "total_files": 0,
+        "total_bytes": 0,
+        "card_count": 0,
+        "device_count": 0,
+        "oldest_received_at": None,
+        "newest_received_at": None,
+        "cards": [],
+        "cards_truncated": False,
+        "all_card_uuids": [],
+        "all_device_ids": [],
+    }
+
+
+def test_summary_caps_the_number_of_card_groups(signed_in, db_path, uploads_path, monkeypatch):
+    monkeypatch.setattr(dashboard, "MAX_CARD_GROUPS", 2)
+    for index in range(3):
+        insert_upload(
+            db_path, uploads_path, "logger-0001.csv", card_uuid=f"CARD-{index:04d}"
+        )
+
+    body = signed_in.get("/dashboard/api/uploads/summary").json()
+
+    assert len(body["cards"]) == 2
+    assert body["cards_truncated"] is True
+    # The uncapped totals still describe every row.
+    assert body["total_files"] == 3
+    assert body["card_count"] == 3
+
+
+@pytest.mark.parametrize("query", ["limit=5", "offset=5", "sort=size", "unknown=1"])
+def test_summary_rejects_parameters_that_only_apply_to_the_list(signed_in, query):
+    assert signed_in.get(f"/dashboard/api/uploads/summary?{query}").status_code == 422
+
+
+def test_summary_reports_a_database_failure_as_unavailable(signed_in, monkeypatch):
+    def explode(*args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(dashboard, "read_connection", explode)
+    response = signed_in.get("/dashboard/api/uploads/summary")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Could not read stored uploads"
+
+
+def test_summary_never_exposes_the_stored_path(signed_in, db_path, uploads_path):
+    insert_upload(db_path, uploads_path, "logger-0001.csv")
+    response = signed_in.get("/dashboard/api/uploads/summary")
+
+    assert "stored_path" not in response.text
+    assert str(uploads_path) not in response.text
 
 
 # === Criterion 5: CSV preview ================================================

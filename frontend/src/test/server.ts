@@ -6,7 +6,7 @@
 
 import { vi } from "vitest";
 
-import type { PiStatus, UploadPage, UploadPreview } from "../api";
+import type { PiStatus, UploadItem, UploadPage, UploadPreview, UploadSummary } from "../api";
 
 export interface Reply {
   status: number;
@@ -25,6 +25,7 @@ export interface FakeApi {
   login: Handler;
   status: Handler;
   uploads: Handler;
+  summary: Handler;
   preview: Handler;
 }
 
@@ -34,7 +35,8 @@ export function installApi(overrides: Partial<FakeApi> = {}): FakeApi {
     session: () => ok({ authenticated: true, expires_at: "2026-08-01T03:30:00Z" }),
     login: () => ({ status: 204 }),
     status: () => ok(statusFixture()),
-    uploads: () => ok({ items: [], next_before_id: null } satisfies UploadPage),
+    uploads: () => ok(pageFixture([])),
+    summary: () => ok(summaryFixture()),
     preview: () => ok(previewFixture()),
     ...overrides,
   };
@@ -62,8 +64,15 @@ function route(api: FakeApi, url: string, init?: RequestInit): Reply {
   }
   if (url.includes("/status")) return api.status(url, init);
   if (url.includes("/preview")) return api.preview(url, init);
+  // Checked before the list: the summary path starts with the list path.
+  if (url.includes("/uploads/summary")) return api.summary(url, init);
   if (url.includes("/uploads")) return api.uploads(url, init);
   return { status: 404, body: { detail: "Not Found" } };
+}
+
+/** Read a query parameter back off a recorded or handled request URL. */
+export function paramOf(url: string, name: string): string | null {
+  return new URL(url, "http://localhost").searchParams.get(name);
 }
 
 export function statusFixture(overrides: Partial<PiStatus> = {}): PiStatus {
@@ -77,7 +86,7 @@ export function statusFixture(overrides: Partial<PiStatus> = {}): PiStatus {
   };
 }
 
-export function uploadFixture(id: number, overrides: Record<string, unknown> = {}) {
+export function uploadFixture(id: number, overrides: Partial<UploadItem> = {}): UploadItem {
   return {
     id,
     device_id: "raspberrypi-uploader",
@@ -85,6 +94,44 @@ export function uploadFixture(id: number, overrides: Record<string, unknown> = {
     filename: `logger-${String(id).padStart(4, "0")}.csv`,
     size: 1234,
     received_at: "2026-07-31T14:02:00Z",
+    ...overrides,
+  };
+}
+
+/** A page whose `total` defaults to "these items are all of them". */
+export function pageFixture(items: UploadItem[], overrides: Partial<UploadPage> = {}): UploadPage {
+  return {
+    items,
+    total: items.length,
+    limit: 50,
+    offset: 0,
+    sort: "received_at",
+    order: "desc",
+    ...overrides,
+  };
+}
+
+export function summaryFixture(overrides: Partial<UploadSummary> = {}): UploadSummary {
+  return {
+    total_files: 2,
+    total_bytes: 2468,
+    card_count: 1,
+    device_count: 1,
+    oldest_received_at: "2026-07-31T14:01:00Z",
+    newest_received_at: "2026-07-31T14:02:00Z",
+    cards: [
+      {
+        device_id: "raspberrypi-uploader",
+        card_uuid: "A1B2-C3D4",
+        file_count: 2,
+        total_bytes: 2468,
+        oldest_received_at: "2026-07-31T14:01:00Z",
+        newest_received_at: "2026-07-31T14:02:00Z",
+      },
+    ],
+    cards_truncated: false,
+    all_card_uuids: ["A1B2-C3D4"],
+    all_device_ids: ["raspberrypi-uploader"],
     ...overrides,
   };
 }

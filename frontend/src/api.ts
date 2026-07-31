@@ -30,9 +30,59 @@ export interface UploadItem {
   received_at: string;
 }
 
+/** The columns the server will order by. Anything else is a 422. */
+export const SORT_KEYS = ["received_at", "filename", "card_uuid", "device_id", "size"] as const;
+export type SortKey = (typeof SORT_KEYS)[number];
+export type SortOrder = "asc" | "desc";
+
 export interface UploadPage {
   items: UploadItem[];
-  next_before_id: number | null;
+  /** Rows matching the filters, not rows on this page. */
+  total: number;
+  limit: number;
+  offset: number;
+  sort: SortKey;
+  order: SortOrder;
+}
+
+/** One card's rollup, as the grouped view renders it. */
+export interface CardSummary {
+  device_id: string;
+  card_uuid: string;
+  file_count: number;
+  total_bytes: number;
+  oldest_received_at: string;
+  newest_received_at: string;
+}
+
+export interface UploadSummary {
+  total_files: number;
+  total_bytes: number;
+  card_count: number;
+  device_count: number;
+  oldest_received_at: string | null;
+  newest_received_at: string | null;
+  cards: CardSummary[];
+  cards_truncated: boolean;
+  /** Every stored value, ignoring the active filters, so a control can be changed back. */
+  all_card_uuids: string[];
+  all_device_ids: string[];
+}
+
+/** Which rows a request is about. Empty strings mean "not filtered". */
+export interface UploadFilters {
+  q: string;
+  cardUuid: string;
+  deviceId: string;
+}
+
+export const NO_FILTERS: UploadFilters = { q: "", cardUuid: "", deviceId: "" };
+
+export interface UploadQuery extends UploadFilters {
+  sort: SortKey;
+  order: SortOrder;
+  limit: number;
+  offset: number;
 }
 
 export interface UploadPreview {
@@ -146,9 +196,41 @@ export async function getStatus(): Promise<PiStatus> {
   return readJson<PiStatus>("/status");
 }
 
-export async function listUploads(beforeId: number | null = null): Promise<UploadPage> {
-  const query = beforeId === null ? "" : `?before_id=${encodeURIComponent(String(beforeId))}`;
-  return readJson<UploadPage>(`/uploads${query}`);
+/** The filter parameters, omitting the ones that are not set.
+ *
+ * An empty value is left out rather than sent as `""`: the server validates
+ * every parameter it receives, and "no filter" is the absence of one.
+ */
+function filterParams(filters: UploadFilters): URLSearchParams {
+  const params = new URLSearchParams();
+  if (filters.q.trim() !== "") {
+    params.set("q", filters.q.trim());
+  }
+  if (filters.cardUuid !== "") {
+    params.set("card_uuid", filters.cardUuid);
+  }
+  if (filters.deviceId !== "") {
+    params.set("device_id", filters.deviceId);
+  }
+  return params;
+}
+
+function suffix(params: URLSearchParams): string {
+  const query = params.toString();
+  return query === "" ? "" : `?${query}`;
+}
+
+export async function listUploads(query: UploadQuery): Promise<UploadPage> {
+  const params = filterParams(query);
+  params.set("sort", query.sort);
+  params.set("order", query.order);
+  params.set("limit", String(query.limit));
+  params.set("offset", String(query.offset));
+  return readJson<UploadPage>(`/uploads${suffix(params)}`);
+}
+
+export async function getUploadSummary(filters: UploadFilters): Promise<UploadSummary> {
+  return readJson<UploadSummary>(`/uploads/summary${suffix(filterParams(filters))}`);
 }
 
 export async function getPreview(uploadId: number): Promise<UploadPreview> {

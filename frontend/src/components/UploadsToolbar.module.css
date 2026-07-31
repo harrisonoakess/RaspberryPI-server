@@ -1,0 +1,94 @@
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.75rem;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+/* The search box takes the slack; the selects stay at their natural width. */
+.field:first-child {
+  flex: 1 1 14rem;
+}
+
+.label {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.input,
+.select {
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.9375rem;
+  max-width: 100%;
+}
+
+.trailing {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: auto;
+}
+
+.viewSwitch {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.viewButton {
+  padding: 0.45rem 0.8rem;
+  border: 0;
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 0.9375rem;
+}
+
+.viewButton + .viewButton {
+  border-left: 1px solid var(--border);
+}
+
+.viewButton:hover {
+  color: var(--accent);
+}
+
+.active {
+  background: var(--neutral-surface);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.clear {
+  padding: 0.45rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.9375rem;
+}
+
+.clear:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+@media (max-width: 40rem) {
+  .trailing {
+    margin-left: 0;
+    width: 100%;
+  }
+}

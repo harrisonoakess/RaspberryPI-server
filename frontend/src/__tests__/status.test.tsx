@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -18,7 +18,10 @@ describe("connection status", () => {
     expect(screen.getByText(/last heartbeat/i)).toBeInTheDocument();
     // The exact UTC value stays available even though local time is displayed.
     expect(screen.getByTitle("2026-07-31T14:00:00Z")).toBeInTheDocument();
-    expect(screen.getByText("raspberrypi-uploader")).toBeInTheDocument();
+    // Scoped to the status card: the same device also names an option in the
+    // uploads device filter below it.
+    const card = screen.getByRole("region", { name: /pi connection/i });
+    expect(within(card).getByText("raspberrypi-uploader")).toBeInTheDocument();
   });
 
   it("shows offline as a heartbeat age, not a live socket", async () => {

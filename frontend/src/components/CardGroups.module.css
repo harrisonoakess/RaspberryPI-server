@@ -1,0 +1,82 @@
+.groups {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.group {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  min-width: 0;
+}
+
+.heading {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 400;
+}
+
+.toggle {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.6rem;
+  width: 100%;
+  padding: 0.6rem 0.75rem;
+  border: 0;
+  background: var(--surface-sunken);
+  color: var(--text);
+  text-align: left;
+}
+
+.toggle:hover .cardUuid {
+  color: var(--accent);
+}
+
+.chevron {
+  color: var(--text-muted);
+}
+
+.cardUuid {
+  font-family: var(--mono);
+  font-weight: 600;
+}
+
+.device,
+.counts,
+.latest {
+  font-size: 0.8125rem;
+  color: var(--text-muted);
+}
+
+/* Pushed right so the counts line up down the list of cards. */
+.counts {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.files {
+  padding: 0.75rem;
+  border-top: 1px solid var(--border);
+}
+
+.state {
+  margin: 0;
+  padding: 0.75rem;
+  color: var(--text-muted);
+}
+
+.error {
+  margin: 0.75rem;
+  padding: 0.6rem 0.7rem;
+  border-radius: var(--radius);
+  background: var(--offline-surface);
+  color: var(--offline);
+}
+
+@media (max-width: 40rem) {
+  .counts {
+    margin-left: 0;
+  }
+}

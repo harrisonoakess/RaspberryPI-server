@@ -27,6 +27,7 @@ import sqlite3
 import time
 from collections import deque
 from contextlib import closing
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -67,6 +68,29 @@ ONLINE_WINDOW_SECONDS = 600
 DEFAULT_UPLOAD_PAGE_SIZE = 50
 MAX_UPLOAD_PAGE_SIZE = 100
 
+# A filename substring long enough for any real name but short enough that the
+# LIKE pattern stays cheap.
+MAX_SEARCH_CHARACTERS = 255
+
+# The grouped view is a browsing aid, not an export: past this many cards the
+# response says so rather than growing without bound.
+MAX_CARD_GROUPS = 200
+
+# Sortable columns, mapped to the SQL that orders them. Nothing from the request
+# is ever interpolated into the statement — only these fixed fragments are, and
+# only after the requested key matched a member of this mapping. Text columns
+# sort case-insensitively so `Logger` and `logger` sit together.
+UPLOAD_SORT_COLUMNS = {
+    "received_at": "received_at",
+    "filename": "filename COLLATE NOCASE",
+    "card_uuid": "card_uuid COLLATE NOCASE",
+    "device_id": "device_id COLLATE NOCASE",
+    "size": "size",
+}
+DEFAULT_UPLOAD_SORT = "received_at"
+UPLOAD_SORT_ORDERS = {"asc": "ASC", "desc": "DESC"}
+DEFAULT_UPLOAD_ORDER = "desc"
+
 MAX_PREVIEW_RECORDS = 100
 MAX_PREVIEW_FIELD_CHARACTERS = 262_144
 MAX_PREVIEW_CONTENT_BYTES = 1_048_576
@@ -76,8 +100,10 @@ CSV_PARSER_FIELD_LIMIT = MAX_PREVIEW_FIELD_CHARACTERS * 2
 
 # Decimal integers with no sign, no padding, and no surrounding whitespace.
 CANONICAL_POSITIVE_INTEGER = re.compile(r"\A[1-9][0-9]*\Z")
+CANONICAL_NON_NEGATIVE_INTEGER = re.compile(r"\A(?:0|[1-9][0-9]*)\Z")
 
-UPLOAD_QUERY_PARAMETERS = frozenset({"limit", "before_id"})
+UPLOAD_FILTER_PARAMETERS = frozenset({"q", "card_uuid", "device_id"})
+UPLOAD_LIST_PARAMETERS = UPLOAD_FILTER_PARAMETERS | {"limit", "offset", "sort", "order"}
 
 # `style-src` allows inline styles because the Radix dialog sets positioning and
 # scroll-lock styles on elements at runtime (§4). `script-src` stays strict:
@@ -375,7 +401,40 @@ class UploadItem(BaseModel):
 
 class UploadListResponse(BaseModel):
     items: list[UploadItem]
-    next_before_id: Optional[int]
+    # `total` counts every row matching the filters, not just this page, so the
+    # client can render "1-50 of 812" and size its pager without a second call.
+    total: int
+    limit: int
+    offset: int
+    sort: str
+    order: str
+
+
+class CardSummary(BaseModel):
+    """One card's contribution, as the grouped view renders it."""
+
+    device_id: str
+    card_uuid: str
+    file_count: int
+    total_bytes: int
+    oldest_received_at: str
+    newest_received_at: str
+
+
+class UploadSummaryResponse(BaseModel):
+    total_files: int
+    total_bytes: int
+    card_count: int
+    device_count: int
+    oldest_received_at: Optional[str]
+    newest_received_at: Optional[str]
+    cards: list[CardSummary]
+    cards_truncated: bool
+    # The full set of values, deliberately *not* narrowed by the active filters:
+    # these populate the filter controls, and a control that only offered the
+    # value already selected could never be changed.
+    all_card_uuids: list[str]
+    all_device_ids: list[str]
 
 
 class PreviewResponse(BaseModel):
@@ -384,6 +443,184 @@ class PreviewResponse(BaseModel):
     card_uuid: str
     records: list[list[str]]
     truncated: bool
+
+
+# --- Upload queries -----------------------------------------------------------
+
+
+def _escape_like(value: str) -> str:
+    r"""Neutralize the LIKE wildcards in user text, for `ESCAPE '\'`.
+
+    Without this a search for `_` or `%` would match every filename rather than
+    the literal character the user typed.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+@dataclass(frozen=True)
+class UploadFilters:
+    """The subset of rows a request is asking about.
+
+    The same instance drives the list query, its total, and the summary, so a
+    filtered table and the statistics above it can never describe different
+    row sets.
+    """
+
+    search: Optional[str] = None
+    card_uuid: Optional[str] = None
+    device_id: Optional[str] = None
+
+    @property
+    def active(self) -> bool:
+        return any((self.search, self.card_uuid, self.device_id))
+
+    def where(self) -> tuple[str, list[Any]]:
+        """A `WHERE ...` fragment (or empty) and its bound parameters."""
+        clauses: list[str] = []
+        parameters: list[Any] = []
+
+        if self.device_id is not None:
+            clauses.append("device_id = ?")
+            parameters.append(self.device_id)
+        if self.card_uuid is not None:
+            clauses.append("card_uuid = ?")
+            parameters.append(self.card_uuid)
+        if self.search is not None:
+            # SQLite's LIKE is already case-insensitive for ASCII, which is the
+            # whole of the accepted filename alphabet.
+            clauses.append("filename LIKE ? ESCAPE '\\'")
+            parameters.append(f"%{_escape_like(self.search)}%")
+
+        if not clauses:
+            return "", []
+        return " WHERE " + " AND ".join(clauses), parameters
+
+
+def _single_valued_query(request: Request, allowed: frozenset[str]) -> dict[str, str]:
+    """Every recognized query parameter, at most once each.
+
+    An unknown or repeated parameter is a 422 rather than something silently
+    ignored: a misspelled filter that quietly returned everything would read as
+    a filter that found nothing to exclude.
+    """
+    seen: dict[str, str] = {}
+    for key, value in request.query_params.multi_items():
+        if key not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"unknown query parameter: {key}",
+            )
+        if key in seen:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"query parameter must not be repeated: {key}",
+            )
+        seen[key] = value
+    return seen
+
+
+def _upload_filters(seen: dict[str, str]) -> UploadFilters:
+    """Read the filter parameters, rejecting values no stored row could hold."""
+    search = None
+    if "q" in seen:
+        # Trimmed because a trailing space from a paste is never the intent, and
+        # a whitespace-only search means "no search" rather than "match nothing".
+        candidate = seen["q"].strip()
+        if len(candidate) > MAX_SEARCH_CHARACTERS:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"q must be at most {MAX_SEARCH_CHARACTERS} characters",
+            )
+        search = candidate or None
+
+    card_uuid = None
+    if "card_uuid" in seen and seen["card_uuid"]:
+        card_uuid = seen["card_uuid"]
+        if not _server().CARD_UUID_PATTERN.match(card_uuid):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="card_uuid is not a valid card identifier",
+            )
+
+    device_id = None
+    if "device_id" in seen and seen["device_id"]:
+        device_id = seen["device_id"]
+        if not _server().DEVICE_ID_PATTERN.match(device_id):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="device_id is not a valid device identifier",
+            )
+
+    return UploadFilters(search=search, card_uuid=card_uuid, device_id=device_id)
+
+
+def _upload_ordering(seen: dict[str, str]) -> tuple[str, str]:
+    """The validated `(sort, order)` keys, defaulting to newest first."""
+    sort = seen.get("sort", DEFAULT_UPLOAD_SORT)
+    if sort not in UPLOAD_SORT_COLUMNS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"sort must be one of: {', '.join(sorted(UPLOAD_SORT_COLUMNS))}",
+        )
+
+    order = seen.get("order", DEFAULT_UPLOAD_ORDER)
+    if order not in UPLOAD_SORT_ORDERS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="order must be one of: asc, desc",
+        )
+    return sort, order
+
+
+def _order_by(sort: str, order: str) -> str:
+    """`ORDER BY` for a validated sort key, always broken by a unique column.
+
+    Sizes and timestamps tie freely. Without `id` behind them, two rows sharing
+    a value could swap places between one page and the next, so a row would be
+    shown twice while another was never shown at all.
+    """
+    direction = UPLOAD_SORT_ORDERS[order]
+    return f" ORDER BY {UPLOAD_SORT_COLUMNS[sort]} {direction}, id {direction}"
+
+
+def _upload_paging(seen: dict[str, str]) -> tuple[int, int]:
+    """The validated `(limit, offset)` for a list request."""
+    limit = DEFAULT_UPLOAD_PAGE_SIZE
+    if "limit" in seen:
+        if not CANONICAL_POSITIVE_INTEGER.match(seen["limit"]):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"limit must be an integer from 1 to {MAX_UPLOAD_PAGE_SIZE}",
+            )
+        limit = int(seen["limit"])
+        if limit > MAX_UPLOAD_PAGE_SIZE:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"limit must be an integer from 1 to {MAX_UPLOAD_PAGE_SIZE}",
+            )
+
+    offset = 0
+    if "offset" in seen:
+        if not CANONICAL_NON_NEGATIVE_INTEGER.match(seen["offset"]):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="offset must be a non-negative integer",
+            )
+        offset = int(seen["offset"])
+
+    return limit, offset
+
+
+def _rendered_timestamp(value: Any, context: str) -> str:
+    """Re-render a stored timestamp, refusing to guess at one we cannot read."""
+    try:
+        return _server().rfc3339_utc(parse_rfc3339_utc(value))
+    except (ValueError, TypeError) as exc:
+        logger.error("%s is not an RFC 3339 UTC timestamp", context)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not read stored uploads",
+        ) from exc
 
 
 # --- CSV preview --------------------------------------------------------------
@@ -651,22 +888,25 @@ def register_dashboard(app: FastAPI) -> None:
         dependencies=[Depends(require_session)],
     )
     def list_uploads(request: Request, settings=Depends(get_settings)) -> UploadListResponse:
-        limit, before_id = _upload_query(request)
+        seen = _single_valued_query(request, UPLOAD_LIST_PARAMETERS)
+        filters = _upload_filters(seen)
+        sort, order = _upload_ordering(seen)
+        limit, offset = _upload_paging(seen)
 
-        # One extra row answers "is there another page?" without a second query.
-        sql = (
-            "SELECT id, device_id, card_uuid, filename, size, received_at FROM uploads "
-        )
-        parameters: list[Any] = []
-        if before_id is not None:
-            sql += "WHERE id < ? "
-            parameters.append(before_id)
-        sql += "ORDER BY id DESC LIMIT ?"
-        parameters.append(limit + 1)
+        where, filter_parameters = filters.where()
 
         try:
             with closing(read_connection(settings.database_path)) as connection:
-                rows = connection.execute(sql, parameters).fetchall()
+                total = int(
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM uploads{where}", filter_parameters
+                    ).fetchone()[0]
+                )
+                rows = connection.execute(
+                    "SELECT id, device_id, card_uuid, filename, size, received_at "
+                    f"FROM uploads{where}{_order_by(sort, order)} LIMIT ? OFFSET ?",
+                    [*filter_parameters, limit, offset],
+                ).fetchall()
         except sqlite3.Error as exc:
             logger.exception("Could not read the uploads table for the dashboard")
             raise HTTPException(
@@ -674,37 +914,129 @@ def register_dashboard(app: FastAPI) -> None:
                 detail="Could not read stored uploads",
             ) from exc
 
-        has_more = len(rows) > limit
-        page = rows[:limit]
-
-        items = []
-        for row in page:
-            try:
-                received_at = _server().rfc3339_utc(parse_rfc3339_utc(row["received_at"]))
-            except (ValueError, TypeError) as exc:
-                logger.error(
-                    "Upload row %s has a received_at that is not an RFC 3339 UTC "
-                    "timestamp",
-                    row["id"],
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="Could not read stored uploads",
-                ) from exc
-            items.append(
-                UploadItem(
-                    id=int(row["id"]),
-                    device_id=row["device_id"],
-                    card_uuid=row["card_uuid"],
-                    filename=row["filename"],
-                    size=int(row["size"]),
-                    received_at=received_at,
-                )
+        items = [
+            UploadItem(
+                id=int(row["id"]),
+                device_id=row["device_id"],
+                card_uuid=row["card_uuid"],
+                filename=row["filename"],
+                size=int(row["size"]),
+                received_at=_rendered_timestamp(
+                    row["received_at"], f"Upload row {row['id']} received_at"
+                ),
             )
+            for row in rows
+        ]
 
         return UploadListResponse(
-            items=items,
-            next_before_id=int(page[-1]["id"]) if has_more and page else None,
+            items=items, total=total, limit=limit, offset=offset, sort=sort, order=order
+        )
+
+    @app.get(
+        "/dashboard/api/uploads/summary",
+        response_model=UploadSummaryResponse,
+        dependencies=[Depends(require_session)],
+    )
+    def summarize_uploads(
+        request: Request, settings=Depends(get_settings)
+    ) -> UploadSummaryResponse:
+        """Totals and per-card rollups for the same rows the list would return.
+
+        Registered ahead of `/uploads/{upload_id}/preview` only in reading order;
+        the paths do not overlap, so no route shadows another.
+        """
+        filters = _upload_filters(
+            _single_valued_query(request, UPLOAD_FILTER_PARAMETERS)
+        )
+        where, filter_parameters = filters.where()
+
+        try:
+            with closing(read_connection(settings.database_path)) as connection:
+                totals = connection.execute(
+                    "SELECT COUNT(*) AS total_files, "
+                    "COALESCE(SUM(size), 0) AS total_bytes, "
+                    # A card identity is a device and a card together: the same
+                    # card UUID read on two devices is two rollups, so counting
+                    # bare UUIDs here would disagree with the rows below.
+                    "COUNT(DISTINCT device_id || '/' || card_uuid) AS card_count, "
+                    "COUNT(DISTINCT device_id) AS device_count, "
+                    "MIN(received_at) AS oldest, MAX(received_at) AS newest "
+                    f"FROM uploads{where}",
+                    filter_parameters,
+                ).fetchone()
+
+                # One past the cap distinguishes "exactly at the cap" from
+                # "more than we will show".
+                card_rows = connection.execute(
+                    "SELECT device_id, card_uuid, COUNT(*) AS file_count, "
+                    "COALESCE(SUM(size), 0) AS total_bytes, "
+                    "MIN(received_at) AS oldest, MAX(received_at) AS newest "
+                    f"FROM uploads{where} GROUP BY device_id, card_uuid "
+                    "ORDER BY newest DESC, card_uuid COLLATE NOCASE ASC LIMIT ?",
+                    [*filter_parameters, MAX_CARD_GROUPS + 1],
+                ).fetchall()
+
+                # Unfiltered on purpose: see `all_card_uuids` on the model.
+                all_card_uuids = [
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT DISTINCT card_uuid FROM uploads "
+                        "ORDER BY card_uuid COLLATE NOCASE"
+                    )
+                ]
+                all_device_ids = [
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT DISTINCT device_id FROM uploads "
+                        "ORDER BY device_id COLLATE NOCASE"
+                    )
+                ]
+        except sqlite3.Error as exc:
+            logger.exception("Could not summarize the uploads table for the dashboard")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Could not read stored uploads",
+            ) from exc
+
+        cards_truncated = len(card_rows) > MAX_CARD_GROUPS
+        cards = [
+            CardSummary(
+                device_id=row["device_id"],
+                card_uuid=row["card_uuid"],
+                file_count=int(row["file_count"]),
+                total_bytes=int(row["total_bytes"]),
+                oldest_received_at=_rendered_timestamp(
+                    row["oldest"], f"Card {row['card_uuid']} oldest received_at"
+                ),
+                newest_received_at=_rendered_timestamp(
+                    row["newest"], f"Card {row['card_uuid']} newest received_at"
+                ),
+            )
+            for row in card_rows[:MAX_CARD_GROUPS]
+        ]
+
+        # MIN/MAX over the stored text is chronological because every row this
+        # server writes is second-precision UTC with a `Z` suffix.
+        total_files = int(totals["total_files"])
+        return UploadSummaryResponse(
+            total_files=total_files,
+            total_bytes=int(totals["total_bytes"]),
+            card_count=int(totals["card_count"]),
+            device_count=int(totals["device_count"]),
+            oldest_received_at=(
+                _rendered_timestamp(totals["oldest"], "Oldest upload received_at")
+                if total_files
+                else None
+            ),
+            newest_received_at=(
+                _rendered_timestamp(totals["newest"], "Newest upload received_at")
+                if total_files
+                else None
+            ),
+            cards=cards,
+            cards_truncated=cards_truncated,
+            all_card_uuids=all_card_uuids,
+            all_device_ids=all_device_ids,
         )
 
     @app.get(
@@ -786,43 +1118,3 @@ def register_dashboard(app: FastAPI) -> None:
         return _spa_shell(settings)
 
 
-def _upload_query(request: Request) -> tuple[int, Optional[int]]:
-    """Validate `limit` and `before_id`, rejecting anything else with a 422."""
-    seen: dict[str, str] = {}
-    for key, value in request.query_params.multi_items():
-        if key not in UPLOAD_QUERY_PARAMETERS:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"unknown query parameter: {key}",
-            )
-        if key in seen:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"query parameter must not be repeated: {key}",
-            )
-        seen[key] = value
-
-    limit = DEFAULT_UPLOAD_PAGE_SIZE
-    if "limit" in seen:
-        if not CANONICAL_POSITIVE_INTEGER.match(seen["limit"]):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"limit must be an integer from 1 to {MAX_UPLOAD_PAGE_SIZE}",
-            )
-        limit = int(seen["limit"])
-        if limit > MAX_UPLOAD_PAGE_SIZE:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"limit must be an integer from 1 to {MAX_UPLOAD_PAGE_SIZE}",
-            )
-
-    before_id = None
-    if "before_id" in seen:
-        if not CANONICAL_POSITIVE_INTEGER.match(seen["before_id"]):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="before_id must be a positive integer",
-            )
-        before_id = int(seen["before_id"])
-
-    return limit, before_id
