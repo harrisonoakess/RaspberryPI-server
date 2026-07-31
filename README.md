@@ -201,6 +201,23 @@ npm test        # Vitest + React Testing Library
 npm run build   # production Vite build
 ```
 
+#### Regenerating the frontend lockfile
+
+Adding or upgrading a dependency? Regenerate the lockfile with the **npm the
+container ships** (10.9.8, bundled with Node 22.23.2), resolving for Linux:
+
+```bash
+cd frontend
+npx -y npm@10.9.8 install --package-lock-only --os=linux --cpu=x64 --libc=glibc
+npm ci        # confirm it still installs on your own machine
+```
+
+A plain `npm install` on macOS with a newer npm writes a lockfile that is
+missing Rolldown's optional `@emnapi/*` wasm dependencies. It works locally and
+then fails the Docker build with `npm ci can only install packages when your
+package.json and package-lock.json are in sync`. The command above records the
+Linux resolution as well, and the result still installs on macOS.
+
 Hardware and platform behaviour (real cards, real mounts, real WiFi association,
 systemd, Railway volumes) is **not** covered by either suite and is verified
 manually below, as is the [browser smoke test](#browser-smoke-test).

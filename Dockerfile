@@ -13,6 +13,12 @@ FROM node:22.23.2-bookworm-slim@sha256:f32b81066cde10a75dbac96646099533316d94bac
 WORKDIR /build
 
 # Dependencies first: this layer is reused whenever only source files change.
+#
+# `npm ci` refuses to install from a lockfile that does not resolve on *this*
+# platform. Rolldown's optional wasm fallback pulls @emnapi/*, and a lockfile
+# written by a newer npm on macOS omits those entries, which fails here. Always
+# regenerate the lockfile with the npm this image ships (10.9.8, bundled with
+# Node 22.23.2) — see the README's "Regenerating the frontend lockfile".
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 
