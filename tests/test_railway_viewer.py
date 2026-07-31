@@ -29,10 +29,12 @@ CREATE TABLE pings (
 CREATE TABLE uploads (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     device_id TEXT NOT NULL,
+    card_uuid TEXT NOT NULL,
     filename TEXT NOT NULL,
     stored_path TEXT NOT NULL,
     size INTEGER NOT NULL,
-    received_at TEXT NOT NULL
+    received_at TEXT NOT NULL,
+    UNIQUE (device_id, card_uuid, filename)
 );
 """
 
@@ -52,10 +54,11 @@ def make_database(path: Path, count: int = 1, device_prefix: str = "pi") -> Path
             )
             connection.execute(
                 "INSERT INTO uploads "
-                "(device_id, filename, stored_path, size, received_at) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "(device_id, card_uuid, filename, stored_path, size, received_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     f"{device_prefix}-{index}",
+                    f"CARD-{index:04d}",
                     f"logger-{index:04d}.csv",
                     str(path.parent / f"private-{index}.csv"),
                     index,
@@ -134,10 +137,44 @@ def test_list_returns_latest_50_newest_first_without_stored_paths(tmp_path):
     assert payload["ok"] is True
     assert [row["id"] for row in payload["pings"]] == list(range(55, 5, -1))
     assert [row["id"] for row in payload["uploads"]] == list(range(55, 5, -1))
+    assert payload["uploads"][0]["card_uuid"] == "CARD-0055"
     assert all("stored_path" not in row for row in payload["uploads"])
     assert database.read_bytes() == before
     assert "mode=ro" in viewer.REMOTE_PYTHON
     assert "PRAGMA query_only=ON" in viewer.REMOTE_PYTHON
+
+
+def test_list_keeps_same_device_and_filename_distinct_across_cards(tmp_path):
+    database = make_database(tmp_path / "pings.db")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO uploads "
+            "(device_id, card_uuid, filename, stored_path, size, received_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "pi-1",
+                "SECOND-CARD",
+                "logger-0001.csv",
+                str(tmp_path / "private-second-card.csv"),
+                2,
+                "2026-07-29T00:03:00Z",
+            ),
+        )
+
+    payload = remote(
+        tmp_path,
+        "list",
+        env_updates={"DATABASE_PATH": str(database)},
+    )
+
+    assert [
+        (row["device_id"], row["card_uuid"], row["filename"])
+        for row in payload["uploads"]
+    ] == [
+        ("pi-1", "SECOND-CARD", "logger-0001.csv"),
+        ("pi-1", "CARD-0001", "logger-0001.csv"),
+    ]
+    assert all("stored_path" not in row for row in payload["uploads"])
 
 
 def test_preview_parses_quoted_unicode_csv(tmp_path):
@@ -155,6 +192,7 @@ def test_preview_parses_quoted_unicode_csv(tmp_path):
     assert payload == {
         "ok": True,
         "upload_id": 1,
+        "card_uuid": "CARD-0001",
         "filename": "logger-0001.csv",
         "records": [["name", "value"], ["sensor, one", "café"]],
         "truncated": False,
@@ -396,6 +434,9 @@ def test_server_binds_to_loopback_and_page_uses_safe_dom_rendering():
     assert "textContent" in html
     assert "innerHTML" not in html
     assert "Refresh" in html
+    assert "Card UUID" in html
+    assert "upload.card_uuid" in html
+    assert "payload.card_uuid" in html
 
 
 def test_json_routes_return_data_with_security_headers(monkeypatch):
@@ -408,6 +449,7 @@ def test_json_routes_return_data_with_security_headers(monkeypatch):
         return {
             "ok": True,
             "upload_id": upload_id,
+            "card_uuid": "CARD-0001",
             "filename": "x.csv",
             "records": [["x"]],
             "truncated": False,

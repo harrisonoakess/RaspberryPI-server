@@ -72,7 +72,7 @@ def list_data(connection):
     uploads = [
         dict(row)
         for row in connection.execute(
-            "SELECT id, device_id, filename, size, received_at "
+            "SELECT id, device_id, card_uuid, filename, size, received_at "
             "FROM uploads ORDER BY id DESC LIMIT 50"
         )
     ]
@@ -90,7 +90,8 @@ def preview(connection, raw_upload_id):
         return
 
     row = connection.execute(
-        "SELECT filename, stored_path FROM uploads WHERE id = ?", (upload_id,)
+        "SELECT card_uuid, filename, stored_path FROM uploads WHERE id = ?",
+        (upload_id,),
     ).fetchone()
     if row is None:
         fail("Upload was not found.")
@@ -129,6 +130,7 @@ def preview(connection, raw_upload_id):
         {
             "ok": True,
             "upload_id": upload_id,
+            "card_uuid": row["card_uuid"],
             "filename": row["filename"],
             "records": records[:100],
             "truncated": truncated,
@@ -196,7 +198,7 @@ PAGE_HTML = """<!doctype html>
     <h2 id="uploads-heading">Latest uploads</h2>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>ID</th><th>Device</th><th>Filename</th><th>Bytes</th><th>Received</th><th></th></tr></thead>
+        <thead><tr><th>ID</th><th>Device</th><th>Card UUID</th><th>Filename</th><th>Bytes</th><th>Received</th><th></th></tr></thead>
         <tbody id="uploads"></tbody>
       </table>
       <p id="uploads-empty" class="empty" hidden>No uploads found.</p>
@@ -265,6 +267,7 @@ PAGE_HTML = """<!doctype html>
         const row = document.createElement("tr");
         cell(row, upload.id);
         cell(row, upload.device_id);
+        cell(row, upload.card_uuid);
         cell(row, upload.filename);
         cell(row, upload.size);
         cell(row, upload.received_at);
@@ -337,7 +340,8 @@ PAGE_HTML = """<!doctype html>
           previewBody.appendChild(row);
         });
         previewStatus.textContent =
-          payload.filename + " — first " + payload.records.length + " record(s)" +
+          payload.card_uuid + " / " + payload.filename + " — first " +
+          payload.records.length + " record(s)" +
           (payload.truncated ? " (more records not shown)" : "");
         previewWrap.hidden = false;
       } catch (error) {
