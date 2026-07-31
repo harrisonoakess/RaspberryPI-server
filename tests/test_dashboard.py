@@ -6,10 +6,14 @@ Nothing in this module may leave a row, a blob, or a stored file modified.
 """
 
 import base64
+import io
 import json
+import re
 import sqlite3
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -19,6 +23,8 @@ import main
 from dashboard import (
     LOGIN_FAILURE_LIMIT,
     LOGIN_FAILURE_WINDOW_SECONDS,
+    MAX_ARCHIVE_BYTES,
+    MAX_ARCHIVE_FILES,
     MAX_PREVIEW_CONTENT_BYTES,
     MAX_PREVIEW_FIELD_CHARACTERS,
     MAX_PREVIEW_RECORDS,
@@ -46,6 +52,8 @@ PROTECTED_ENDPOINTS = (
     "/dashboard/api/uploads",
     "/dashboard/api/uploads/summary",
     "/dashboard/api/uploads/1/preview",
+    "/dashboard/api/uploads/1/download",
+    "/dashboard/api/uploads/archive?ids=1",
 )
 
 
@@ -125,8 +133,13 @@ def insert_upload(
     received_at="2026-07-31T14:02:00Z",
     stored_path=None,
     write_blob=True,
+    size=None,
 ):
-    """Store one upload the way `POST /upload` does, returning its row id."""
+    """Store one upload the way `POST /upload` does, returning its row id.
+
+    `size` overrides the recorded byte count without writing a blob that large,
+    so the archive's byte ceiling can be exercised without a huge fixture.
+    """
     blob = Path(stored_path) if stored_path else uploads_path / device_id / card_uuid / filename
     if write_blob:
         blob.parent.mkdir(parents=True, exist_ok=True)
@@ -135,7 +148,14 @@ def insert_upload(
         cursor = connection.execute(
             "INSERT INTO uploads (device_id, card_uuid, filename, stored_path, size, "
             "received_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (device_id, card_uuid, filename, str(blob), len(content), received_at),
+            (
+                device_id,
+                card_uuid,
+                filename,
+                str(blob),
+                len(content) if size is None else size,
+                received_at,
+            ),
         )
         return int(cursor.lastrowid)
 
@@ -1108,6 +1128,338 @@ def test_preview_does_not_modify_the_stored_file_or_row(signed_in, db_path, uplo
     assert blob.read_bytes() == content
     with sqlite3.connect(db_path) as connection:
         assert connection.execute("SELECT * FROM uploads").fetchall() == before
+
+
+# === Criterion 6: file downloads =============================================
+
+
+def test_download_returns_the_stored_bytes_exactly(signed_in, db_path, uploads_path):
+    # CRLF, a BOM, and no trailing newline: everything a helpful reader would
+    # be tempted to normalize away.
+    content = b"\xef\xbb\xbfsensor,value\r\ntemperature,21.4"
+    upload_id = insert_upload(db_path, uploads_path, "logger-0001.csv", content=content)
+
+    response = signed_in.get(f"/dashboard/api/uploads/{upload_id}/download")
+
+    assert response.status_code == 200
+    assert response.content == content
+
+
+def test_download_returns_a_file_that_preview_refuses(signed_in, db_path, uploads_path):
+    """A blob that is not valid UTF-8 is still the bytes that were received."""
+    content = b"sensor,value\n\xff\xfe,2\n"
+    upload_id = insert_upload(db_path, uploads_path, "logger-0001.csv", content=content)
+
+    assert signed_in.get(f"/dashboard/api/uploads/{upload_id}/preview").status_code == 422
+
+    response = signed_in.get(f"/dashboard/api/uploads/{upload_id}/download")
+    assert response.status_code == 200
+    assert response.content == content
+
+
+def test_download_is_an_attachment_named_for_the_stored_file(signed_in, db_path, uploads_path):
+    upload_id = insert_upload(db_path, uploads_path, "logger-0042.csv")
+
+    response = signed_in.get(f"/dashboard/api/uploads/{upload_id}/download")
+
+    disposition = response.headers["content-disposition"]
+    assert disposition.startswith("attachment")
+    assert "logger-0042.csv" in disposition
+    assert response.headers["content-type"].startswith("text/csv")
+
+
+def test_download_encodes_a_non_ascii_filename(signed_in, db_path, uploads_path):
+    upload_id = insert_upload(db_path, uploads_path, "données-café.csv")
+
+    response = signed_in.get(f"/dashboard/api/uploads/{upload_id}/download")
+
+    assert response.status_code == 200
+    disposition = response.headers["content-disposition"]
+    # RFC 5987, and no raw non-ASCII byte smuggled into the header.
+    assert "filename*=utf-8''" in disposition
+    assert "donn%C3%A9es-caf%C3%A9.csv" in disposition
+    disposition.encode("ascii")
+
+
+@pytest.mark.parametrize("upload_id", ["0", "-1", "abc", "01", "1.5", " 1"])
+def test_a_non_canonical_download_id_is_rejected(signed_in, upload_id):
+    assert signed_in.get(f"/dashboard/api/uploads/{upload_id}/download").status_code == 422
+
+
+def test_download_of_an_unknown_upload_is_not_found(signed_in):
+    assert signed_in.get("/dashboard/api/uploads/999/download").status_code == 404
+
+
+def test_download_of_a_missing_stored_file_is_a_conflict(signed_in, db_path, uploads_path):
+    upload_id = insert_upload(db_path, uploads_path, "logger-0001.csv", write_blob=False)
+
+    response = signed_in.get(f"/dashboard/api/uploads/{upload_id}/download")
+
+    assert response.status_code == 409
+    assert str(uploads_path) not in response.text
+
+
+def test_download_of_a_path_outside_the_uploads_root_is_a_conflict(
+    signed_in, db_path, uploads_path, tmp_path
+):
+    escaped = tmp_path / "elsewhere" / "secret.csv"
+    escaped.parent.mkdir(parents=True, exist_ok=True)
+    escaped.write_text("secret,data\n", encoding="utf-8")
+    upload_id = insert_upload(
+        db_path, uploads_path, "secret.csv", stored_path=escaped, write_blob=False
+    )
+
+    response = signed_in.get(f"/dashboard/api/uploads/{upload_id}/download")
+
+    assert response.status_code == 409
+    assert "secret" not in response.text
+
+
+def test_a_download_filesystem_failure_is_unavailable(
+    signed_in, db_path, uploads_path, monkeypatch
+):
+    """The route reads the blob's metadata itself, so this is a 503, not a late 500."""
+    upload_id = insert_upload(db_path, uploads_path, "logger-0001.csv")
+    real_stat = Path.stat
+
+    def explode(self, *args, **kwargs):
+        if self.name == "logger-0001.csv":
+            raise OSError("input/output error")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", explode)
+    response = signed_in.get(f"/dashboard/api/uploads/{upload_id}/download")
+
+    assert response.status_code == 503
+    assert str(uploads_path) not in response.text
+
+
+def test_download_rejects_unknown_query_parameters(signed_in, db_path, uploads_path):
+    upload_id = insert_upload(db_path, uploads_path, "logger-0001.csv")
+
+    assert signed_in.get(f"/dashboard/api/uploads/{upload_id}/download?foo=1").status_code == 422
+
+
+def test_download_never_exposes_the_stored_path(signed_in, db_path, uploads_path):
+    upload_id = insert_upload(db_path, uploads_path, "logger-0001.csv")
+
+    response = signed_in.get(f"/dashboard/api/uploads/{upload_id}/download")
+
+    assert all(str(uploads_path) not in value for value in response.headers.values())
+
+
+def test_download_does_not_modify_the_stored_file_or_row(signed_in, db_path, uploads_path):
+    content = b"sensor,value\n1,2\n"
+    upload_id = insert_upload(db_path, uploads_path, "logger-0001.csv", content=content)
+    blob = uploads_path / DEVICE / CARD_A / "logger-0001.csv"
+    with sqlite3.connect(db_path) as connection:
+        before = connection.execute("SELECT * FROM uploads").fetchall()
+
+    assert signed_in.get(f"/dashboard/api/uploads/{upload_id}/download").status_code == 200
+
+    assert blob.read_bytes() == content
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("SELECT * FROM uploads").fetchall() == before
+
+
+# --- Multi-file archives ---
+
+
+def zip_of(response):
+    return zipfile.ZipFile(io.BytesIO(response.content))
+
+
+def test_archive_members_match_the_stored_bytes(signed_in, db_path, uploads_path):
+    first = b"sensor,value\n1,2\n"
+    second = b"sensor,value\n3,4\n"
+    third = b"sensor,value\n5,6\n"
+    one = insert_upload(db_path, uploads_path, "logger-0001.csv", content=first)
+    two = insert_upload(db_path, uploads_path, "logger-0002.csv", content=second)
+    three = insert_upload(
+        db_path, uploads_path, "logger-0003.csv", content=third, card_uuid=CARD_B
+    )
+
+    response = signed_in.get(f"/dashboard/api/uploads/archive?ids={one},{two},{three}")
+
+    assert response.status_code == 200
+    archive = zip_of(response)
+    assert archive.testzip() is None
+    assert archive.namelist() == [
+        f"{DEVICE}/{CARD_A}/logger-0001.csv",
+        f"{DEVICE}/{CARD_A}/logger-0002.csv",
+        f"{DEVICE}/{CARD_B}/logger-0003.csv",
+    ]
+    assert archive.read(f"{DEVICE}/{CARD_A}/logger-0001.csv") == first
+    assert archive.read(f"{DEVICE}/{CARD_A}/logger-0002.csv") == second
+    assert archive.read(f"{DEVICE}/{CARD_B}/logger-0003.csv") == third
+
+
+def test_archive_disambiguates_same_named_files_from_different_cards(
+    signed_in, db_path, uploads_path
+):
+    """The point of the device/card/file layout: neither file overwrites the other."""
+    from_a = b"card,a\n"
+    from_b = b"card,b\n"
+    one = insert_upload(db_path, uploads_path, "logger-0001.csv", content=from_a, card_uuid=CARD_A)
+    two = insert_upload(db_path, uploads_path, "logger-0001.csv", content=from_b, card_uuid=CARD_B)
+
+    archive = zip_of(signed_in.get(f"/dashboard/api/uploads/archive?ids={one},{two}"))
+
+    assert len(archive.namelist()) == 2
+    assert archive.read(f"{DEVICE}/{CARD_A}/logger-0001.csv") == from_a
+    assert archive.read(f"{DEVICE}/{CARD_B}/logger-0001.csv") == from_b
+
+
+def test_archive_is_an_attachment_named_as_a_zip(signed_in, db_path, uploads_path):
+    upload_id = insert_upload(db_path, uploads_path, "logger-0001.csv")
+
+    response = signed_in.get(f"/dashboard/api/uploads/archive?ids={upload_id}")
+
+    assert response.headers["content-type"] == "application/zip"
+    disposition = response.headers["content-disposition"]
+    assert disposition.startswith("attachment")
+    assert re.search(r'filename="uploads-\d{8}-\d{6}Z\.zip"', disposition)
+
+
+def test_archive_is_byte_identical_for_the_same_selection(signed_in, db_path, uploads_path):
+    """Ordering and timestamps come from the rows, not from the request or the disk."""
+    one = insert_upload(db_path, uploads_path, "logger-0002.csv")
+    two = insert_upload(db_path, uploads_path, "logger-0001.csv")
+
+    first = signed_in.get(f"/dashboard/api/uploads/archive?ids={one},{two}")
+    second = signed_in.get(f"/dashboard/api/uploads/archive?ids={two},{one}")
+
+    assert first.content == second.content
+
+
+@pytest.mark.parametrize("ids", ["", "1,", ",1", "1,,2", "01", "-1", "abc", " 1", "1 ,2", "1,1"])
+def test_archive_rejects_a_malformed_ids_parameter(signed_in, ids):
+    assert signed_in.get(f"/dashboard/api/uploads/archive?ids={ids}").status_code == 422
+
+
+def test_archive_requires_ids(signed_in):
+    assert signed_in.get("/dashboard/api/uploads/archive").status_code == 422
+
+
+def test_archive_rejects_unknown_or_repeated_query_parameters(signed_in):
+    assert signed_in.get("/dashboard/api/uploads/archive?ids=1&ids=2").status_code == 422
+    assert signed_in.get("/dashboard/api/uploads/archive?ids=1&foo=2").status_code == 422
+
+
+def test_archive_rejects_more_ids_than_the_file_cap(signed_in):
+    ids = ",".join(str(n) for n in range(1, MAX_ARCHIVE_FILES + 2))
+
+    response = signed_in.get(f"/dashboard/api/uploads/archive?ids={ids}")
+
+    assert response.status_code == 422
+    assert str(MAX_ARCHIVE_FILES) in response.json()["detail"]
+
+
+def test_archive_rejects_a_selection_over_the_byte_cap(
+    signed_in, db_path, uploads_path, monkeypatch
+):
+    """The `size` column is enough to refuse: no blob is opened."""
+    upload_id = insert_upload(
+        db_path, uploads_path, "logger-0001.csv", size=MAX_ARCHIVE_BYTES + 1
+    )
+
+    def explode(self, *args, **kwargs):
+        raise AssertionError("no stored file should be opened")
+
+    monkeypatch.setattr(Path, "open", explode)
+    response = signed_in.get(f"/dashboard/api/uploads/archive?ids={upload_id}")
+
+    assert response.status_code == 422
+    assert str(MAX_ARCHIVE_BYTES) in response.json()["detail"]
+
+
+def test_archive_with_an_unknown_id_is_not_found(signed_in, db_path, uploads_path):
+    """All or nothing: a partial archive would drop a file with nothing to notice it."""
+    upload_id = insert_upload(db_path, uploads_path, "logger-0001.csv")
+
+    assert signed_in.get(f"/dashboard/api/uploads/archive?ids={upload_id},999").status_code == 404
+
+
+def test_archive_rejects_a_missing_member_before_streaming(signed_in, db_path, uploads_path):
+    present = insert_upload(db_path, uploads_path, "logger-0001.csv")
+    absent = insert_upload(db_path, uploads_path, "logger-0002.csv", write_blob=False)
+
+    response = signed_in.get(f"/dashboard/api/uploads/archive?ids={present},{absent}")
+
+    # A JSON body at all proves the check ran before any header was committed.
+    assert response.status_code == 409
+    assert response.json()["detail"]
+    assert str(uploads_path) not in response.text
+
+
+def test_archive_rejects_an_outside_root_member_before_streaming(
+    signed_in, db_path, uploads_path, tmp_path
+):
+    escaped = tmp_path / "elsewhere" / "secret.csv"
+    escaped.parent.mkdir(parents=True, exist_ok=True)
+    escaped.write_text("secret,data\n", encoding="utf-8")
+    present = insert_upload(db_path, uploads_path, "logger-0001.csv")
+    outside = insert_upload(
+        db_path, uploads_path, "secret.csv", stored_path=escaped, write_blob=False
+    )
+
+    response = signed_in.get(f"/dashboard/api/uploads/archive?ids={present},{outside}")
+
+    assert response.status_code == 409
+    assert "secret" not in response.text
+
+
+def test_archive_response_carries_the_documented_headers(signed_in, db_path, uploads_path):
+    """The security middleware still applies to a streamed response."""
+    upload_id = insert_upload(db_path, uploads_path, "logger-0001.csv")
+
+    response = signed_in.get(f"/dashboard/api/uploads/archive?ids={upload_id}")
+
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert "content-security-policy" in response.headers
+
+
+def test_archive_never_exposes_the_stored_path(signed_in, db_path, uploads_path):
+    upload_id = insert_upload(db_path, uploads_path, "logger-0001.csv")
+
+    response = signed_in.get(f"/dashboard/api/uploads/archive?ids={upload_id}")
+
+    assert all(str(uploads_path) not in value for value in response.headers.values())
+
+
+def test_archive_does_not_modify_rows_or_blobs(signed_in, db_path, uploads_path):
+    content = b"sensor,value\n1,2\n"
+    upload_id = insert_upload(db_path, uploads_path, "logger-0001.csv", content=content)
+    blob = uploads_path / DEVICE / CARD_A / "logger-0001.csv"
+    with sqlite3.connect(db_path) as connection:
+        before = connection.execute("SELECT * FROM uploads").fetchall()
+
+    assert signed_in.get(f"/dashboard/api/uploads/archive?ids={upload_id}").status_code == 200
+
+    assert blob.read_bytes() == content
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("SELECT * FROM uploads").fetchall() == before
+
+
+def test_a_read_failure_mid_archive_does_not_yield_a_valid_zip(settings, db_path, uploads_path):
+    """Past the preflight there is no way to report an error, so the ZIP is left
+    structurally invalid rather than finished with a member silently missing."""
+    def explode(self, *args, **kwargs):
+        raise OSError("input/output error")
+
+    with TestClient(create_app(settings), raise_server_exceptions=False) as client:
+        # Created inside the client so the schema exists before the row is written.
+        upload_id = insert_upload(db_path, uploads_path, "logger-0001.csv")
+        assert client.post("/dashboard/api/session", json={"password": PASSWORD}).status_code == 204
+        with mock.patch.object(Path, "open", explode):
+            response = client.get(f"/dashboard/api/uploads/archive?ids={upload_id}")
+
+    # 200 because the preflight passed and the headers were already sent: this
+    # is the case that cannot be reported, not one caught before streaming.
+    assert response.status_code == 200
+    with pytest.raises(zipfile.BadZipFile):
+        zipfile.ZipFile(io.BytesIO(response.content)).testzip()
 
 
 # === Response headers and static hosting =====================================

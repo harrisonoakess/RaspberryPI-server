@@ -1,4 +1,4 @@
-"""Private read-only dashboard: session auth, status, upload list, CSV preview.
+"""Private dashboard: session auth, status, upload list, CSV preview, downloads.
 
 Mounted by `main.create_app` under `/dashboard`. JSON APIs live under
 `/dashboard/api`; the compiled React application and its SPA fallback are served
@@ -6,9 +6,10 @@ from `/dashboard` so the browser, the read APIs, and the ingest endpoints all
 share one origin and no CORS configuration is required.
 
 Everything here reads. Nothing in this module writes to the database, the
-uploads root, or any stored blob.
+uploads root, or any stored blob — including the download routes, which return
+stored bytes and leave the row and the file exactly as they were.
 
-See prd/phase-4-frontend-dashboard.md.
+See prd/phase-4-frontend-dashboard.md and prd/phase-5-file-downloads.md.
 """
 
 from __future__ import annotations
@@ -22,9 +23,11 @@ import ipaddress
 import json
 import logging
 import math
+import os
 import re
 import sqlite3
 import time
+import zipfile
 from collections import deque
 from contextlib import closing
 from dataclasses import dataclass
@@ -33,7 +36,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 logger = logging.getLogger("piserver.dashboard")
@@ -98,12 +101,32 @@ MAX_PREVIEW_CONTENT_BYTES = 1_048_576
 # check with a 422 rather than by the parser's global limit.
 CSV_PARSER_FIELD_LIMIT = MAX_PREVIEW_FIELD_CHARACTERS * 2
 
+# One archive request never covers more rows than one page of the list can show,
+# so "select everything on this page" always fits. The same number is already
+# MAX_UPLOAD_PAGE_SIZE and the grouped view's per-card ceiling.
+MAX_ARCHIVE_FILES = MAX_UPLOAD_PAGE_SIZE
+# Summed from the `size` column before any file is opened. Roughly twelve
+# maximum-size uploads: generous for real logger CSVs, and short of the 2 GiB
+# that 100 files at the ingest ceiling would be.
+MAX_ARCHIVE_BYTES = 268_435_456  # 256 MiB
+# Blobs are copied into the archive in chunks so peak memory is one chunk plus
+# deflate state, and so a disconnected client is noticed promptly rather than
+# after a whole file. Matches the ingest path's chunk size.
+ARCHIVE_CHUNK_BYTES = 262_144
+# zlib's default: CSV text deflates several-fold at a small fraction of the CPU
+# level 9 costs for a marginal gain.
+ARCHIVE_COMPRESS_LEVEL = 6
+# The ZIP format cannot represent a timestamp before this.
+ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+
 # Decimal integers with no sign, no padding, and no surrounding whitespace.
 CANONICAL_POSITIVE_INTEGER = re.compile(r"\A[1-9][0-9]*\Z")
 CANONICAL_NON_NEGATIVE_INTEGER = re.compile(r"\A(?:0|[1-9][0-9]*)\Z")
 
 UPLOAD_FILTER_PARAMETERS = frozenset({"q", "card_uuid", "device_id"})
 UPLOAD_LIST_PARAMETERS = UPLOAD_FILTER_PARAMETERS | {"limit", "offset", "sort", "order"}
+DOWNLOAD_PARAMETERS: frozenset[str] = frozenset()
+ARCHIVE_PARAMETERS = frozenset({"ids"})
 
 # `style-src` allows inline styles because the Radix dialog sets positioning and
 # scroll-lock styles on elements at runtime (§4). `script-src` stays strict:
@@ -675,12 +698,14 @@ def preview_records(text: str) -> tuple[list[list[str]], bool]:
     return records, truncated
 
 
-def load_preview_text(settings, stored_path: str) -> str:
-    """Read a stored blob as strict UTF-8 after confirming it is in the root.
+def resolve_stored_path(settings, stored_path: str) -> Path:
+    """Resolve a row's blob path after confirming it is inside the uploads root.
 
     The path comes from a row selected by integer upload ID, but it is still
     re-checked against the configured uploads root: a row that points anywhere
-    else is a conflict, not a file to open.
+    else is a conflict, not a file to open. `resolve()` follows symlinks, so a
+    link inside the root that points outside it resolves outside and is refused
+    on exactly the same footing as a stored path that was never in the root.
     """
     uploads_root = settings.uploads_root
     try:
@@ -700,12 +725,30 @@ def load_preview_text(settings, stored_path: str) -> str:
             detail="The stored file for this upload is unavailable",
         )
 
-    if not resolved.is_file():
+    try:
+        is_file = resolved.is_file()
+    except OSError as exc:
+        # A path that cannot be examined at all is a read failure, not a row
+        # that points at nothing.
+        logger.exception("Could not examine a stored upload blob")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not read the stored file",
+        ) from exc
+
+    if not is_file:
         logger.warning("Upload row has no readable stored file")
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="The stored file for this upload is unavailable",
         )
+
+    return resolved
+
+
+def load_preview_text(settings, stored_path: str) -> str:
+    """Read a stored blob as strict UTF-8 after confirming it is in the root."""
+    resolved = resolve_stored_path(settings, stored_path)
 
     try:
         raw = resolved.read_bytes()
@@ -721,6 +764,240 @@ def load_preview_text(settings, stored_path: str) -> str:
         return raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise PreviewRejected("The stored file is not valid UTF-8 text.") from exc
+
+
+# --- Downloads ----------------------------------------------------------------
+
+
+def stat_stored_file(resolved: Path) -> os.stat_result:
+    """Stat a blob here rather than letting the response do it later.
+
+    `FileResponse` stats the file again when it sends, and a failure there
+    happens after the route has returned — an unhandled 500 instead of a 503.
+    Reading the metadata up front turns that into an ordinary error response.
+    """
+    try:
+        return resolved.stat()
+    except OSError as exc:
+        logger.exception("Could not stat a stored upload blob")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not read the stored file",
+        ) from exc
+
+
+def parse_archive_ids(raw: str) -> list[int]:
+    """Read the comma-separated `ids` parameter, rejecting anything ambiguous.
+
+    No padding, no blanks, no repeats: a request that asks for the same file
+    twice has no unambiguous archive, and no control in the dashboard can
+    produce one. Rejecting is consistent with how every other parameter here
+    treats a value it cannot read exactly one way.
+    """
+    if raw == "":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="ids must be a comma-separated list of upload IDs",
+        )
+
+    identifiers: list[int] = []
+    seen: set[int] = set()
+    for element in raw.split(","):
+        if not CANONICAL_POSITIVE_INTEGER.match(element):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="ids must be a comma-separated list of upload IDs",
+            )
+        identifier = int(element)
+        if identifier in seen:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="ids must not repeat an upload ID",
+            )
+        seen.add(identifier)
+        identifiers.append(identifier)
+
+    # Checked before any query runs, which is also what keeps the request URI
+    # bounded well inside every server's request-line limit.
+    if len(identifiers) > MAX_ARCHIVE_FILES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"an archive may contain at most {MAX_ARCHIVE_FILES} files",
+        )
+
+    return identifiers
+
+
+def _archive_member_name(row) -> str:
+    """`device_id/card_uuid/filename`, re-validated component by component.
+
+    The three parts come from a database row rather than from the request, so
+    they are checked against the same whitelists ingest applied before they
+    become path segments inside the archive. A row that fails is corrupt in the
+    same way a `stored_path` outside the uploads root is corrupt.
+    """
+    server = _server()
+    device_id = row["device_id"]
+    card_uuid = row["card_uuid"]
+    filename = row["filename"]
+    try:
+        if not isinstance(device_id, str) or not server.DEVICE_ID_PATTERN.match(device_id):
+            raise ValueError("device_id is not a valid identifier")
+        server.validate_card_uuid(card_uuid)
+        server.validate_filename(filename)
+    except (ValueError, TypeError) as exc:
+        logger.error("Refusing to archive an upload row with an unusable identity")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The stored file for this upload is unavailable",
+        ) from exc
+
+    return f"{device_id}/{card_uuid}/{filename}"
+
+
+def _archive_timestamp(received_at: Any) -> tuple[int, int, int, int, int, int]:
+    """A ZIP `date_time` from the row's `received_at`, not the file's mtime.
+
+    Using the stored timestamp keeps an archive identical across a volume
+    restore that rewrites mtimes, and avoids `zipfile`'s hard failure on any
+    modification time before 1980.
+    """
+    try:
+        moment = parse_rfc3339_utc(received_at)
+    except (ValueError, TypeError):
+        return ZIP_EPOCH
+    stamp = (moment.year, moment.month, moment.day, moment.hour, moment.minute, moment.second)
+    return stamp if stamp >= ZIP_EPOCH else ZIP_EPOCH
+
+
+@dataclass(frozen=True)
+class ArchiveMember:
+    """One validated file, ready to be copied into the archive."""
+
+    path: Path
+    name: str
+    date_time: tuple[int, int, int, int, int, int]
+
+
+def collect_archive_members(settings, identifiers: list[int]) -> list[ArchiveMember]:
+    """Resolve every requested row, or fail before a single byte is sent.
+
+    Once the response starts streaming there is no way to report a problem, so
+    everything that can be checked is checked here: that every requested ID
+    exists, that the selection fits under the byte cap, and that each blob is
+    present inside the uploads root with a usable name.
+    """
+    placeholders = ",".join("?" for _ in identifiers)
+    try:
+        with closing(read_connection(settings.database_path)) as connection:
+            rows = connection.execute(
+                "SELECT id, device_id, card_uuid, filename, size, received_at, stored_path "
+                f"FROM uploads WHERE id IN ({placeholders})",
+                identifiers,
+            ).fetchall()
+    except sqlite3.Error as exc:
+        logger.exception("Could not read upload rows for an archive")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not read stored uploads",
+        ) from exc
+
+    # All or nothing: an archive quietly missing a file the user selected is
+    # worse than an error, because nothing on the client can notice.
+    if len(rows) != len(identifiers):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload not found")
+
+    total_bytes = sum(row["size"] for row in rows)
+    if total_bytes > MAX_ARCHIVE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "the selected files exceed the "
+                f"{MAX_ARCHIVE_BYTES}-byte archive limit; select fewer files"
+            ),
+        )
+
+    members = [
+        ArchiveMember(
+            path=resolve_stored_path(settings, row["stored_path"]),
+            name=_archive_member_name(row),
+            date_time=_archive_timestamp(row["received_at"]),
+        )
+        for row in rows
+    ]
+    # Sorted by name rather than by the order the IDs arrived: the archive is a
+    # function of which files were chosen, not of the order they were ticked, so
+    # the same selection always produces the same bytes.
+    members.sort(key=lambda member: member.name)
+    return members
+
+
+class _ChunkSink:
+    """A write-only sink with no `tell` or `seek`.
+
+    `zipfile` detects that it cannot seek and emits data descriptors instead of
+    rewriting local headers, which is what makes a streamed archive possible
+    without buffering the whole thing first.
+    """
+
+    def __init__(self) -> None:
+        self._chunks: list[bytes] = []
+
+    def write(self, data: bytes) -> int:
+        self._chunks.append(bytes(data))
+        return len(data)
+
+    def flush(self) -> None:
+        return None
+
+    def drain(self) -> bytes:
+        if not self._chunks:
+            return b""
+        payload = b"".join(self._chunks)
+        self._chunks.clear()
+        return payload
+
+
+def stream_archive(members: list[ArchiveMember]):
+    """Yield the ZIP a chunk at a time.
+
+    A read that fails here is past the point where an error could be reported,
+    so it is logged and allowed to propagate: the central directory is never
+    written, and every extractor reports the truncated result as corrupt. A
+    finished archive silently missing a member would not be noticeable at all.
+    """
+    sink = _ChunkSink()
+    with zipfile.ZipFile(
+        sink,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=ARCHIVE_COMPRESS_LEVEL,
+        allowZip64=True,
+    ) as archive:
+        for member in members:
+            info = zipfile.ZipInfo(member.name, date_time=member.date_time)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            try:
+                with archive.open(info, "w") as entry, member.path.open("rb") as source:
+                    while True:
+                        chunk = source.read(ARCHIVE_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        entry.write(chunk)
+                        payload = sink.drain()
+                        if payload:
+                            yield payload
+            except OSError:
+                logger.exception("Could not read a stored blob while streaming an archive")
+                raise
+            payload = sink.drain()
+            if payload:
+                yield payload
+
+    payload = sink.drain()
+    if payload:
+        yield payload
 
 
 # --- Static assets ------------------------------------------------------------
@@ -1084,6 +1361,76 @@ def register_dashboard(app: FastAPI) -> None:
             card_uuid=row["card_uuid"],
             records=records,
             truncated=truncated,
+        )
+
+    # --- Downloads ---
+
+    @app.get(
+        "/dashboard/api/uploads/archive",
+        dependencies=[Depends(require_session)],
+    )
+    def download_archive(request: Request, settings=Depends(get_settings)) -> StreamingResponse:
+        seen = _single_valued_query(request, ARCHIVE_PARAMETERS)
+        if "ids" not in seen:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="ids is required",
+            )
+
+        members = collect_archive_members(settings, parse_archive_ids(seen["ids"]))
+        name = datetime.now(timezone.utc).strftime("uploads-%Y%m%d-%H%M%SZ.zip")
+
+        return StreamingResponse(
+            stream_archive(members),
+            media_type="application/zip",
+            # The name is ASCII by construction, so the plain form is enough.
+            # Browsers using `fetch` ignore this and name the file themselves;
+            # it is here for `curl` and any other direct client.
+            headers={"Content-Disposition": f'attachment; filename="{name}"'},
+        )
+
+    @app.get(
+        "/dashboard/api/uploads/{upload_id}/download",
+        dependencies=[Depends(require_session)],
+    )
+    def download_upload(
+        upload_id: str, request: Request, settings=Depends(get_settings)
+    ) -> FileResponse:
+        _single_valued_query(request, DOWNLOAD_PARAMETERS)
+        if not CANONICAL_POSITIVE_INTEGER.match(upload_id):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="upload_id must be a positive integer",
+            )
+        identifier = int(upload_id)
+
+        try:
+            with closing(read_connection(settings.database_path)) as connection:
+                row = connection.execute(
+                    "SELECT id, filename, stored_path FROM uploads WHERE id = ?",
+                    (identifier,),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            logger.exception("Could not read an upload row for download")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Could not read stored uploads",
+            ) from exc
+
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Upload not found"
+            )
+
+        resolved = resolve_stored_path(settings, row["stored_path"])
+        # The blob is returned exactly as stored. Unlike the preview, a file
+        # that is not valid UTF-8 or not valid CSV still downloads: this is the
+        # bytes that were received, not an interpretation of them.
+        return FileResponse(
+            resolved,
+            media_type="text/csv",
+            filename=row["filename"],
+            stat_result=stat_stored_file(resolved),
         )
 
     # --- Compiled frontend ---

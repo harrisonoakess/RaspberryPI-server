@@ -93,6 +93,21 @@ export interface UploadPreview {
   truncated: boolean;
 }
 
+/** A downloaded payload and the name it should be saved under. */
+export interface DownloadedFile {
+  blob: Blob;
+  filename: string;
+}
+
+/** The server's archive limits, mirrored so a doomed request is never sent.
+ *
+ * The server check is the authoritative one; these exist only so the reason a
+ * selection is too large can be shown before a round trip. They must match
+ * `MAX_ARCHIVE_FILES` and `MAX_ARCHIVE_BYTES` in `server/dashboard.py`.
+ */
+export const MAX_ARCHIVE_FILES = 100;
+export const MAX_ARCHIVE_BYTES = 268_435_456;
+
 const BASE = "/dashboard/api";
 
 export class ApiError extends Error {
@@ -235,4 +250,42 @@ export async function getUploadSummary(filters: UploadFilters): Promise<UploadSu
 
 export async function getPreview(uploadId: number): Promise<UploadPreview> {
   return readJson<UploadPreview>(`/uploads/${encodeURIComponent(String(uploadId))}/preview`);
+}
+
+/** Fetch a binary payload with the same failure mapping as every JSON read.
+ *
+ * A plain `<a download>` would be simpler, but it is the browser that follows
+ * it, not the application: an expired session would be saved to disk as a file
+ * full of `{"detail":"Not authenticated"}` under the CSV's name, and the
+ * dashboard would carry on rendering state the server has already rejected.
+ */
+async function readBlob(path: string): Promise<Blob> {
+  const response = await send(path);
+  if (response.status === 401) {
+    throw new UnauthorizedError();
+  }
+  if (!response.ok) {
+    throw new ApiError(
+      await detailOf(response, "The server could not complete that request."),
+      response.status,
+    );
+  }
+  return response.blob();
+}
+
+export async function downloadUpload(
+  uploadId: number,
+  filename: string,
+): Promise<DownloadedFile> {
+  const blob = await readBlob(`/uploads/${encodeURIComponent(String(uploadId))}/download`);
+  return { blob, filename };
+}
+
+export async function downloadArchive(
+  ids: readonly number[],
+  filename: string,
+): Promise<DownloadedFile> {
+  const params = new URLSearchParams({ ids: ids.join(",") });
+  const blob = await readBlob(`/uploads/archive?${params.toString()}`);
+  return { blob, filename };
 }

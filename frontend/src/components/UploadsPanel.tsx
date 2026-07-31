@@ -12,21 +12,27 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   NO_FILTERS,
   UnauthorizedError,
+  downloadArchive,
   getUploadSummary,
   listUploads,
   type SortKey,
   type SortOrder,
   type UploadFilters,
+  type UploadItem,
   type UploadPage,
   type UploadSummary,
 } from "../api";
+import { archiveFilename, saveBlob } from "../download";
 import { CardGroups } from "./CardGroups";
+import { SelectionBar } from "./SelectionBar";
 import { UploadsSummaryBar } from "./UploadsSummary";
 import { UploadsTable, defaultOrderFor } from "./UploadsTable";
 import { UploadsToolbar, type ViewMode } from "./UploadsToolbar";
 import styles from "./UploadsPanel.module.css";
 
 const PAGE_SIZE = 50;
+
+const NO_SELECTION: ReadonlySet<number> = new Set();
 
 /** Long enough that ordinary typing sends one request, short enough to feel live. */
 const SEARCH_DEBOUNCE_MS = 250;
@@ -64,6 +70,14 @@ export function UploadsPanel({ reloadToken, onUnauthorized }: UploadsPanelProps)
 
   const [summary, setSummary] = useState<UploadSummary | null>(null);
   const [summaryError, setSummaryError] = useState<string | null>(null);
+
+  // Selection covers the rows currently on screen and nothing else. The panel
+  // only ever holds one page, so a selection that outlived a page change would
+  // name files whose size and filename it could no longer show — a count the
+  // interface could not honestly render.
+  const [selected, setSelected] = useState<ReadonlySet<number>>(NO_SELECTION);
+  const [archiveBusy, setArchiveBusy] = useState(false);
+  const [archiveError, setArchiveError] = useState<string | null>(null);
 
   const { filters, sort, order, offset } = query;
   const filtered = filters.q !== "" || filters.cardUuid !== "" || filters.deviceId !== "";
@@ -103,6 +117,12 @@ export function UploadsPanel({ reloadToken, onUnauthorized }: UploadsPanelProps)
       cancelled = true;
     };
   }, [filters, reloadToken, onUnauthorized]);
+
+  // Any change to what the table lists invalidates what was ticked in it.
+  useEffect(() => {
+    setSelected(NO_SELECTION);
+    setArchiveError(null);
+  }, [filters, sort, order, offset, view, reloadToken]);
 
   useEffect(() => {
     if (view !== "files") {
@@ -173,6 +193,65 @@ export function UploadsPanel({ reloadToken, onUnauthorized }: UploadsPanelProps)
     setQuery((current) => ({ ...current, offset: Math.max(0, nextOffset) }));
   }, []);
 
+  const items: UploadItem[] = useMemo(() => page?.items ?? [], [page]);
+
+  const handleToggle = useCallback((id: number, isSelected: boolean) => {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (isSelected) {
+        next.add(id);
+      } else {
+        next.delete(id);
+      }
+      return next;
+    });
+  }, []);
+
+  const handleToggleAll = useCallback(
+    (isSelected: boolean) => {
+      setSelected(isSelected ? new Set(items.map((item) => item.id)) : NO_SELECTION);
+    },
+    [items],
+  );
+
+  const handleClearSelection = useCallback(() => {
+    setSelected(NO_SELECTION);
+    setArchiveError(null);
+  }, []);
+
+  const selectedItems = useMemo(
+    () => items.filter((item) => selected.has(item.id)),
+    [items, selected],
+  );
+  const selectedBytes = useMemo(
+    () => selectedItems.reduce((total, item) => total + item.size, 0),
+    [selectedItems],
+  );
+
+  const handleDownloadSelected = useCallback(() => {
+    const ids = selectedItems.map((item) => item.id);
+    if (ids.length === 0) {
+      return;
+    }
+    setArchiveBusy(true);
+    setArchiveError(null);
+    void (async () => {
+      try {
+        saveBlob(await downloadArchive(ids, archiveFilename(new Date())));
+      } catch (caught) {
+        if (caught instanceof UnauthorizedError) {
+          onUnauthorized();
+          return;
+        }
+        setArchiveError(
+          caught instanceof Error ? caught.message : "Could not download the selected files.",
+        );
+      } finally {
+        setArchiveBusy(false);
+      }
+    })();
+  }, [selectedItems, onUnauthorized]);
+
   const caption = useMemo(() => {
     if (page === null || page.total === 0) {
       return "Stored uploads.";
@@ -240,6 +319,20 @@ export function UploadsPanel({ reloadToken, onUnauthorized }: UploadsPanelProps)
 
           {page !== null && page.items.length > 0 && (
             <>
+              {archiveError !== null && (
+                <p className={styles.error} role="alert">
+                  {archiveError}
+                </p>
+              )}
+
+              <SelectionBar
+                count={selectedItems.length}
+                bytes={selectedBytes}
+                busy={archiveBusy}
+                onDownload={handleDownloadSelected}
+                onClear={handleClearSelection}
+              />
+
               <UploadsTable
                 items={page.items}
                 sort={sort}
@@ -247,6 +340,11 @@ export function UploadsPanel({ reloadToken, onUnauthorized }: UploadsPanelProps)
                 onSort={handleSort}
                 onUnauthorized={onUnauthorized}
                 caption={caption}
+                selection={{
+                  selected,
+                  onToggle: handleToggle,
+                  onToggleAll: handleToggleAll,
+                }}
               />
               <Pager page={page} loading={pageLoading} onGoTo={goTo} />
             </>

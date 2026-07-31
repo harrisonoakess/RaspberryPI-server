@@ -1,15 +1,16 @@
-# Pi → Railway SD Card Ingestion (Phase 4)
+# Pi → Railway SD Card Ingestion (Phase 5)
 
 A Raspberry Pi copies new CSV files off removable SD cards and uploads them to a
 FastAPI server on Railway whenever it has WiFi. Cards are swapped one at a time,
 and each one is detected, mounted read-only, and ingested with no operator
 command. Files never get lost during connectivity gaps, and re-inserting the
 same card never duplicates a stored file. Built on the Phase 1 connection, which
-is still here as the `/ping` heartbeat. Phase 4 adds a private, read-only
-dashboard at `/dashboard`, served by the same FastAPI process, for checking that
-the Pi is still reporting in and browsing what has been stored. See
-`prd/phase-1-connection.md`, `prd/phase-2-data-sync.md`,
-`prd/phase-3-multi-card-ingestion.md`, and `prd/phase-4-frontend-dashboard.md`.
+is still here as the `/ping` heartbeat. Phase 4 adds a private dashboard at
+`/dashboard`, served by the same FastAPI process, for checking that the Pi is
+still reporting in and browsing what has been stored; Phase 5 adds downloading
+those files, singly or as a ZIP. See `prd/phase-1-connection.md`,
+`prd/phase-2-data-sync.md`, `prd/phase-3-multi-card-ingestion.md`,
+`prd/phase-4-frontend-dashboard.md`, and `prd/phase-5-file-downloads.md`.
 
 The Pi services (`/pi`) deploy independently and are coupled to the server only
 by the HTTP contract below. The server (`/server`) and the dashboard frontend
@@ -71,7 +72,7 @@ Dockerfile                    multi-stage build: Node builds the dashboard, Pyth
 .dockerignore                 keeps local state and node_modules out of the build context
 server/
   main.py                     FastAPI app: POST /ping, POST /upload, GET /health
-  dashboard.py                private read-only dashboard: session auth + read APIs
+  dashboard.py                private dashboard: session auth, read APIs, downloads
   railway.json                Railway deploy config
   .env.example                local backend secrets template (real .env is gitignored)
 frontend/
@@ -107,6 +108,8 @@ prd/                          phase PRDs
 | `GET /dashboard/api/uploads` | session cookie | `200 {"items":[…],"total":…,"limit":…,"offset":…,"sort":…,"order":…}` | `401`, `422` unknown/repeated/invalid parameter, `503` cannot read |
 | `GET /dashboard/api/uploads/summary` | session cookie | `200 {"total_files":…,"total_bytes":…,"cards":[…],"all_card_uuids":[…],…}` | `401`, `422` unknown/repeated/invalid parameter, `503` cannot read |
 | `GET /dashboard/api/uploads/{id}/preview` | session cookie | `200 {"upload_id":…,"filename":…,"card_uuid":…,"records":[[…]],"truncated":…}` | `401`, `404` unknown id, `409` file missing/out of root, `422` bad id or unreadable CSV, `503` cannot read |
+| `GET /dashboard/api/uploads/{id}/download` | session cookie | `200` the stored CSV, `text/csv`, `Content-Disposition: attachment` | `401`, `404` unknown id, `409` file missing/out of root, `422` bad id or any query parameter, `503` cannot read |
+| `GET /dashboard/api/uploads/archive?ids=1,2,3` | session cookie | `200` a ZIP of the requested files, `application/zip`, chunked | `401`, `404` any unknown id, `409` any file missing/out of root, `422` malformed/repeated `ids`, over 100 files or 256 MiB, `503` cannot read |
 
 The dashboard endpoints never accept the ingest `API_KEY`, and the ingest
 endpoints never accept a dashboard session. See [Dashboard](#dashboard).
@@ -403,10 +406,13 @@ redeploy. A ping or upload that fails then succeeds on the next poll.
 questions: is the Pi still checking in, and what has been stored? It is served
 by the same FastAPI process on the same origin as ingest.
 
-**It is read-only.** There is no upload, edit, delete, retention, or full-file
-download path — not hidden, not disabled, absent. Its APIs open SQLite with
-`query_only` set, so the database refuses writes from the dashboard even if a
-future change tried to make one.
+**It cannot change anything.** There is no upload, edit, delete, or retention
+path — not hidden, not disabled, absent. Its APIs open SQLite with `query_only`
+set, so the database refuses writes from the dashboard even if a future change
+tried to make one.
+
+It *can* read files out: see [Downloading](#downloading). A download is a read,
+and it leaves the row and the blob exactly as they were.
 
 ### Signing in
 
@@ -470,6 +476,31 @@ files, non-UTF-8 bytes, malformed CSV, and missing blobs each get their own
 message. Stored paths, environment variables, and filesystem details never reach
 the browser.
 
+### Downloading
+
+**Download** on any row saves that file exactly as it was received — the same
+bytes, the same name. A file the preview refuses because it is not valid UTF-8
+or not valid CSV still downloads: the download returns what was stored, not an
+interpretation of it. The action is available in both the Files and By card
+views.
+
+In the **Files** view each row also has a checkbox, and the header has a
+select-all. **Download selected** returns one ZIP, with members laid out as
+`<device_id>/<card_uuid>/<filename>` — the same shape as the volume, which is
+what keeps two `logger-0001.csv` files from two cards distinct. An archive holds
+at most **100 files** and **256 MiB**; a selection over either ceiling says which
+one it crossed instead of failing at the server.
+
+**Selection covers the page on screen only**, and is cleared by any change to
+what the table lists — a filter, a sort, a page, or **Refresh**. The panel holds
+one page at a time, so a selection that survived a page change would be counting
+files it could no longer name.
+
+Archives are streamed rather than assembled on disk, and everything that can be
+checked is checked first: an unknown ID, an over-cap selection, or a missing blob
+refuses the whole request before any byte is sent. Archives are all or nothing —
+one that quietly dropped a file would give no sign it had.
+
 ### Browser smoke test
 
 Automated tests do not exercise a real browser, so run this once against the
@@ -494,10 +525,22 @@ production build after deploying, at a desktop width and again at a phone width
    `Esc`, and confirm focus returns to the button that opened it.
 9. Open a different file's preview and confirm none of the previous file's rows
    are shown.
-10. Tab through the page: every control is reachable and has a visible focus
-    ring, including the column-header sort buttons. The page itself never
-    scrolls sideways — wide tables scroll inside their own container.
-11. Sign out and confirm the dashboard is gone and the password form is back.
+10. Press **Download** on a row and `diff` the saved file against its source.
+    This is the step that proves the production Content Security Policy allows
+    the download — no automated test can, because the policy is only real in a
+    browser.
+11. Tick two rows from two different cards, press **Download selected**, extract
+    the ZIP, and confirm the `<device>/<card>/<file>` layout and that both files
+    are byte-identical to their sources. Then change the sort and confirm the
+    selection cleared.
+12. Tab through the page: every control is reachable and has a visible focus
+    ring, including the column-header sort buttons and the row checkboxes. With
+    one of two rows ticked, the header checkbox reads as partially checked. The
+    page itself never scrolls sideways — wide tables scroll inside their own
+    container.
+13. Sign out, then press **Download** again from the still-open tab: it must
+    return to the login screen, not save a file. Confirm the dashboard is gone
+    and the password form is back.
 
 ## Phase 2 → Phase 3 rollout (one time)
 
@@ -826,9 +869,17 @@ Record the commands and results for each.
   because the browser needs them to draw the password form. They contain no
   credentials and no stored data. Authentication protects the read APIs and what
   the page renders, not the secrecy of compiled frontend code.
-- CSV previews resolve a path only from a row selected by integer upload ID, and
-  re-check that the resolved path is inside the uploads root before opening it.
-  A row pointing anywhere else is a `409`, not a file read.
+- CSV previews and downloads resolve a path only from a row selected by integer
+  upload ID, and re-check that the resolved path is inside the uploads root
+  before opening it. A row pointing anywhere else is a `409`, not a file read.
+  `resolve()` follows symlinks, so a link inside the root that points outside it
+  is refused on the same footing.
+- Archive members are named from the row's `device_id`, `card_uuid`, and
+  `filename`, each re-validated against the same whitelist ingest applied before
+  it becomes a path segment inside the ZIP — the values come from the database,
+  not from the request, and a row that fails is treated as corrupt. The file
+  count and the byte total are checked from the `size` column before any file is
+  opened, so an over-cap request costs one query and no I/O.
 - `sdcard-watcher` and `uploader` run as the non-root `piuploader` user with
   `NoNewPrivileges`, `ProtectSystem=strict`, and write access limited to
   `/var/log/piuploader` and `/var/lib/piuploader`. Neither has mount privileges.

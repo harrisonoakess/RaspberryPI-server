@@ -11,11 +11,19 @@ import type { PiStatus, UploadItem, UploadPage, UploadPreview, UploadSummary } f
 export interface Reply {
   status: number;
   body?: unknown;
+  /** A binary payload, for the download endpoints. Takes precedence over `body`. */
+  bytes?: Uint8Array;
   headers?: Record<string, string>;
 }
 
 export const ok = (body: unknown): Reply => ({ status: 200, body });
 export const unauthorized = (): Reply => ({ status: 401, body: { detail: "Not authenticated" } });
+
+export const okBytes = (bytes: Uint8Array, contentType: string): Reply => ({
+  status: 200,
+  bytes,
+  headers: { "Content-Type": contentType },
+});
 
 type Handler = (url: string, init?: RequestInit) => Reply;
 
@@ -27,6 +35,8 @@ export interface FakeApi {
   uploads: Handler;
   summary: Handler;
   preview: Handler;
+  download: Handler;
+  archive: Handler;
 }
 
 export function installApi(overrides: Partial<FakeApi> = {}): FakeApi {
@@ -38,6 +48,8 @@ export function installApi(overrides: Partial<FakeApi> = {}): FakeApi {
     uploads: () => ok(pageFixture([])),
     summary: () => ok(summaryFixture()),
     preview: () => ok(previewFixture()),
+    download: () => okBytes(new TextEncoder().encode("sensor,value\n1,2\n"), "text/csv"),
+    archive: () => okBytes(new Uint8Array([0x50, 0x4b, 0x03, 0x04]), "application/zip"),
     ...overrides,
   };
 
@@ -46,6 +58,13 @@ export function installApi(overrides: Partial<FakeApi> = {}): FakeApi {
     api.calls.push(`${init?.method ?? "GET"} ${url}`);
 
     const reply = route(api, url, init);
+    if (reply.bytes !== undefined) {
+      const { buffer, byteOffset, byteLength } = reply.bytes;
+      return new Response(buffer.slice(byteOffset, byteOffset + byteLength) as ArrayBuffer, {
+        status: reply.status,
+        headers: { ...reply.headers },
+      });
+    }
     const body = reply.body === undefined ? "" : JSON.stringify(reply.body);
     return new Response(reply.status === 204 ? null : body, {
       status: reply.status,
@@ -64,10 +83,53 @@ function route(api: FakeApi, url: string, init?: RequestInit): Reply {
   }
   if (url.includes("/status")) return api.status(url, init);
   if (url.includes("/preview")) return api.preview(url, init);
-  // Checked before the list: the summary path starts with the list path.
+  // These three are all checked before the list, because each of their paths
+  // starts with the list path.
+  if (url.includes("/uploads/archive")) return api.archive(url, init);
+  if (url.includes("/download")) return api.download(url, init);
   if (url.includes("/uploads/summary")) return api.summary(url, init);
   if (url.includes("/uploads")) return api.uploads(url, init);
   return { status: 404, body: { detail: "Not Found" } };
+}
+
+/** What the browser was asked to save.
+ *
+ * jsdom implements neither `URL.createObjectURL` nor `revokeObjectURL`, so both
+ * are stubbed here; the anchor click is intercepted so nothing tries to
+ * navigate. Call this per test — `restoreMocks` restores spies but not stubbed
+ * globals, exactly as `installApi` already assumes for `fetch`.
+ */
+export interface SavedFile {
+  filename: string;
+  blob: Blob;
+}
+
+export function installDownloads(): SavedFile[] {
+  const saved: SavedFile[] = [];
+  const urls = new Map<string, Blob>();
+  let counter = 0;
+
+  // Assigned onto the real `URL` rather than stubbed over it: the constructor
+  // is still needed, by `paramOf` among others.
+  URL.createObjectURL = (blob: Blob) => {
+    const url = `blob:mock/${(counter += 1)}`;
+    urls.set(url, blob);
+    return url;
+  };
+  URL.revokeObjectURL = (url: string) => {
+    urls.delete(url);
+  };
+
+  vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+    this: HTMLAnchorElement,
+  ) {
+    const blob = urls.get(this.href);
+    if (blob !== undefined) {
+      saved.push({ filename: this.download, blob });
+    }
+  });
+
+  return saved;
 }
 
 /** Read a query parameter back off a recorded or handled request URL. */

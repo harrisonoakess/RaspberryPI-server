@@ -526,6 +526,10 @@ conflict, the detailed contract and success criteria in §4–§10 control.
 
 ## 12. Post-Phase 4
 
+> Full-file downloads were taken up in `prd/phase-5-file-downloads.md`. The
+> Non-Goal in §3 above records what Phase 4 decided, and is left as it was
+> written; Phase 5 is the current contract for downloads.
+
 - Named administrator accounts, external identity providers, audit logs, and
   password rotation workflows.
 - Independent frontend deployment on Vercel or another static host.

@@ -86,6 +86,23 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* The checkbox column stays as narrow as its control. */
+.selectCell {
+  width: 1px;
+  padding-right: 0.2rem;
+}
+
+.table thead th.selectCell {
+  padding: 0.55rem 0.2rem 0.55rem 0.7rem;
+}
+
+.actions {
+  display: flex;
+  gap: 0.4rem;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
 .visuallyHidden {
   position: absolute;
   width: 1px;

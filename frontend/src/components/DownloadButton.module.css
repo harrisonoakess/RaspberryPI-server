@@ -1,0 +1,25 @@
+.trigger {
+  padding: 0.35rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.trigger:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.trigger:disabled {
+  color: var(--text-muted);
+  cursor: progress;
+}
+
+.error {
+  display: block;
+  margin-top: 0.35rem;
+  color: var(--offline);
+  font-size: 0.8125rem;
+  white-space: normal;
+}
