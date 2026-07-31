@@ -1,8 +1,10 @@
-"""SD card watcher tests — PRD success criteria 3 (offline queueing),
-5 (uploaded-card reinsertion), and 6 (pending-card reinsertion)."""
+"""SD card watcher tests — PRD criteria 4 (watcher discovery), 5 (mount-change
+safety), 6 (per-card local identity), and the Phase 2 delivery guarantees that
+carry forward per card."""
 
 import logging
 import os
+import stat as stat_module
 import sys
 import threading
 from dataclasses import replace
@@ -12,16 +14,18 @@ import pytest
 
 import sdcard_watcher
 from sdcard_watcher import (
+    CardChanged,
     CardError,
+    CardIdentity,
     FileTooLarge,
     WatcherConfig,
-    card_device,
-    card_is_mounted,
     check_once,
     clear_stale_temp_files,
     copy_into_queue,
+    discover_card,
     in_scope_files,
     ingest_card,
+    is_mount_boundary,
     prepare_directories,
     run,
     wait_for_change,
@@ -29,12 +33,18 @@ from sdcard_watcher import (
 from state import STATUS_PENDING, STATUS_UPLOADED, Ledger
 from uploader import ConfigError, StateLogger
 
-CARD_UUID = "1234-ABCD"
+CARD_A = "1234-ABCD"
+CARD_B = "5678-EF01"
+DEVICE_A = 4242
+DEVICE_B = 4343
+
+MOUNTED_A = CardIdentity(uuid=CARD_A, device_number=DEVICE_A)
+MOUNTED_B = CardIdentity(uuid=CARD_B, device_number=DEVICE_B)
 
 
 @pytest.fixture
 def card(tmp_path):
-    """Stands in for the read-only mountpoint of the logger's card."""
+    """Stands in for the read-only mountpoint of a logger's card."""
     mountpoint = tmp_path / "mnt" / "sdcard"
     mountpoint.mkdir(parents=True)
     return mountpoint
@@ -43,9 +53,7 @@ def card(tmp_path):
 @pytest.fixture
 def config(tmp_path, card):
     return WatcherConfig(
-        card_uuid=CARD_UUID,
         card_mountpoint=card,
-        card_filesystem="vfat",
         queue_path=tmp_path / "queue",
         state_db_path=tmp_path / "state.db",
         by_uuid_root=tmp_path / "by-uuid",
@@ -75,46 +83,88 @@ def ready(config, ledger):
     return config
 
 
+@pytest.fixture
+def mounted(monkeypatch):
+    """Pin what `discover_card` reports, one value or a scripted sequence."""
+
+    def install(*identities):
+        remaining = list(identities)
+        last = remaining[-1] if remaining else None
+
+        def fake_discover(_config):
+            return remaining.pop(0) if remaining else last
+
+        monkeypatch.setattr(sdcard_watcher, "discover_card", fake_discover)
+
+    return install
+
+
 def write_card_file(card, name, content=b"a,b\n1,2\n"):
     path = card / name
     path.write_bytes(content)
     return path
 
 
-def queued(config):
+def queued(config, card_uuid=CARD_A):
+    return sorted(entry.name for entry in os.scandir(config.pending_dir_for(card_uuid)))
+
+
+def queued_cards(config):
     return sorted(entry.name for entry in os.scandir(config.pending_dir))
+
+
+class FakeStat:
+    def __init__(self, dev=0, rdev=0, mode=stat_module.S_IFBLK):
+        self.st_dev = dev
+        self.st_rdev = rdev
+        self.st_mode = mode
+
+
+def stat_table(entries):
+    """An `os.stat` replacement backed by a `{path: FakeStat}` table."""
+
+    def fake_stat(path):
+        try:
+            return entries[str(path)]
+        except KeyError:
+            raise FileNotFoundError(str(path)) from None
+
+    return fake_stat
 
 
 # --- Configuration ------------------------------------------------------------
 
 
 def test_config_from_env_applies_documented_defaults():
-    config = WatcherConfig.from_env(
-        {"CARD_UUID": CARD_UUID, "CARD_MOUNTPOINT": "/mnt/sdcard"}
-    )
+    config = WatcherConfig.from_env({"CARD_MOUNTPOINT": "/mnt/sdcard"})
 
-    assert config.card_uuid == CARD_UUID
     assert config.card_mountpoint == Path("/mnt/sdcard")
     assert config.queue_path == Path("/var/lib/piuploader/queue")
     assert config.state_db_path == Path("/var/lib/piuploader/state.db")
-    assert config.max_upload_bytes == 10_485_760
+    assert config.max_upload_bytes == 20_971_520
     assert config.scan_interval_seconds == 5.0
     assert config.pending_dir == Path("/var/lib/piuploader/queue/pending")
     assert config.temp_dir == Path("/var/lib/piuploader/queue/tmp")
 
 
+def test_no_card_specific_configuration_is_required():
+    """Phase 3 removes CARD_UUID and CARD_FILESYSTEM; leftovers are ignored."""
+    config = WatcherConfig.from_env(
+        {"CARD_MOUNTPOINT": "/mnt/sdcard", "CARD_UUID": "stale", "CARD_FILESYSTEM": "vfat"}
+    )
+
+    assert not hasattr(config, "card_uuid")
+    assert not hasattr(config, "card_filesystem")
+
+
 @pytest.mark.parametrize(
     "env",
     [
-        # An unconfigured card must fail loudly rather than fall back to any
-        # removable drive that happens to be attached.
-        {"CARD_MOUNTPOINT": "/mnt/sdcard"},
-        {"CARD_UUID": "", "CARD_MOUNTPOINT": "/mnt/sdcard"},
-        {"CARD_UUID": "  ", "CARD_MOUNTPOINT": "/mnt/sdcard"},
-        {"CARD_UUID": CARD_UUID},
-        {"CARD_UUID": CARD_UUID, "CARD_MOUNTPOINT": ""},
-        {"CARD_UUID": CARD_UUID, "CARD_MOUNTPOINT": "/mnt/sdcard", "MAX_UPLOAD_BYTES": "0"},
-        {"CARD_UUID": CARD_UUID, "CARD_MOUNTPOINT": "/mnt/sdcard", "CARD_SCAN_INTERVAL_SECONDS": "x"},
+        {},
+        {"CARD_MOUNTPOINT": ""},
+        {"CARD_MOUNTPOINT": "   "},
+        {"CARD_MOUNTPOINT": "/mnt/sdcard", "MAX_UPLOAD_BYTES": "0"},
+        {"CARD_MOUNTPOINT": "/mnt/sdcard", "CARD_SCAN_INTERVAL_SECONDS": "x"},
     ],
 )
 def test_invalid_config_is_rejected(env):
@@ -126,62 +176,144 @@ def test_temp_dir_shares_the_queue_filesystem_so_publishing_is_a_rename(config):
     assert config.temp_dir.parent == config.pending_dir.parent
 
 
-# --- Card identity ------------------------------------------------------------
+def test_the_queue_is_namespaced_per_card(config):
+    assert config.pending_dir_for(CARD_A) == config.pending_dir / CARD_A
+    assert config.pending_dir_for(CARD_B) != config.pending_dir_for(CARD_A)
 
 
-def test_card_device_is_none_when_the_card_is_not_inserted(config):
-    config.by_uuid_root.mkdir(parents=True)
-    assert card_device(config) is None
+# --- Criterion 4: watcher discovery -------------------------------------------
 
 
-def test_card_device_is_none_when_the_by_uuid_directory_is_missing(config):
-    assert card_device(config) is None
+def test_nothing_mounted_means_no_card(config, monkeypatch):
+    """The mountpoint shares its device number with its parent directory."""
+    monkeypatch.setattr(
+        sdcard_watcher.os,
+        "stat",
+        stat_table(
+            {
+                str(config.card_mountpoint): FakeStat(dev=1),
+                str(config.card_mountpoint.parent): FakeStat(dev=1),
+            }
+        ),
+    )
+
+    assert is_mount_boundary(config.card_mountpoint) is False
+    assert discover_card(config) is None
 
 
-def test_card_device_resolves_the_by_uuid_symlink(config, tmp_path):
-    config.by_uuid_root.mkdir(parents=True)
-    node = tmp_path / "sda1"
-    node.write_bytes(b"")
-    (config.by_uuid_root / CARD_UUID).symlink_to(node)
+def test_a_non_boundary_mountpoint_never_matches_the_root_filesystem(config, monkeypatch):
+    """Without the boundary guard, "nothing mounted" would resolve to the Pi's
+    own root filesystem UUID and the boot disk would be scanned."""
+    root_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    monkeypatch.setattr(
+        sdcard_watcher.os,
+        "stat",
+        stat_table(
+            {
+                str(config.card_mountpoint): FakeStat(dev=1),
+                str(config.card_mountpoint.parent): FakeStat(dev=1),
+                str(config.by_uuid_root / root_uuid): FakeStat(rdev=1),
+            }
+        ),
+    )
+    monkeypatch.setattr(sdcard_watcher.os, "listdir", lambda _path: [root_uuid])
 
-    assert card_device(config) == node.resolve()
-
-
-def test_a_different_uuid_is_not_the_configured_card(config, tmp_path):
-    config.by_uuid_root.mkdir(parents=True)
-    node = tmp_path / "sdb1"
-    node.write_bytes(b"")
-    (config.by_uuid_root / "0000-FFFF").symlink_to(node)
-
-    assert card_device(config) is None
-
-
-class FakeStat:
-    def __init__(self, dev=0, rdev=0):
-        self.st_dev = dev
-        self.st_rdev = rdev
+    assert discover_card(config) is None
 
 
-def test_card_is_mounted_when_the_mountpoint_holds_that_device(config, monkeypatch):
-    def fake_stat(path):
-        return FakeStat(dev=42) if str(path) == str(config.card_mountpoint) else FakeStat(rdev=42)
+def test_a_mounted_card_returns_its_uuid_dynamically(config, monkeypatch):
+    monkeypatch.setattr(
+        sdcard_watcher.os,
+        "stat",
+        stat_table(
+            {
+                str(config.card_mountpoint): FakeStat(dev=DEVICE_A),
+                str(config.card_mountpoint.parent): FakeStat(dev=1),
+                str(config.by_uuid_root / CARD_A): FakeStat(rdev=DEVICE_A),
+                str(config.by_uuid_root / CARD_B): FakeStat(rdev=DEVICE_B),
+            }
+        ),
+    )
+    monkeypatch.setattr(sdcard_watcher.os, "listdir", lambda _path: [CARD_B, CARD_A])
 
-    monkeypatch.setattr(sdcard_watcher.os, "stat", fake_stat)
-    assert card_is_mounted(config, Path("/dev/sda1")) is True
+    assert discover_card(config) == MOUNTED_A
 
 
-def test_card_is_not_mounted_when_another_filesystem_is_at_the_mountpoint(config, monkeypatch):
-    """Guards against scanning some other removable drive mounted there."""
+def test_a_mounted_device_with_no_matching_uuid_is_not_a_card(config, monkeypatch):
+    monkeypatch.setattr(
+        sdcard_watcher.os,
+        "stat",
+        stat_table(
+            {
+                str(config.card_mountpoint): FakeStat(dev=DEVICE_A),
+                str(config.card_mountpoint.parent): FakeStat(dev=1),
+                str(config.by_uuid_root / CARD_B): FakeStat(rdev=DEVICE_B),
+            }
+        ),
+    )
+    monkeypatch.setattr(sdcard_watcher.os, "listdir", lambda _path: [CARD_B])
 
-    def fake_stat(path):
-        return FakeStat(dev=7) if str(path) == str(config.card_mountpoint) else FakeStat(rdev=42)
-
-    monkeypatch.setattr(sdcard_watcher.os, "stat", fake_stat)
-    assert card_is_mounted(config, Path("/dev/sda1")) is False
+    assert discover_card(config) is None
 
 
-def test_card_is_not_mounted_when_the_mountpoint_cannot_be_stated(config):
-    assert card_is_mounted(config, Path("/dev/does-not-exist")) is False
+@pytest.mark.parametrize(
+    "unsafe", ["", ".", "..", "has/slash", "has space", "a" * 65, "with_underscore", "uuid\n"]
+)
+def test_an_unsafe_uuid_is_never_adopted_as_a_card_identity(config, monkeypatch, unsafe):
+    """An unusable UUID would become a queue path segment and a payload field,
+    so such a card reads as absent rather than being sanitized."""
+    monkeypatch.setattr(
+        sdcard_watcher.os,
+        "stat",
+        stat_table(
+            {
+                str(config.card_mountpoint): FakeStat(dev=DEVICE_A),
+                str(config.card_mountpoint.parent): FakeStat(dev=1),
+                str(config.by_uuid_root / unsafe): FakeStat(rdev=DEVICE_A),
+            }
+        ),
+    )
+    monkeypatch.setattr(sdcard_watcher.os, "listdir", lambda _path: [unsafe])
+
+    assert discover_card(config) is None
+
+
+def test_a_by_uuid_entry_that_is_not_a_block_device_is_ignored(config, monkeypatch):
+    monkeypatch.setattr(
+        sdcard_watcher.os,
+        "stat",
+        stat_table(
+            {
+                str(config.card_mountpoint): FakeStat(dev=DEVICE_A),
+                str(config.card_mountpoint.parent): FakeStat(dev=1),
+                str(config.by_uuid_root / CARD_A): FakeStat(
+                    rdev=DEVICE_A, mode=stat_module.S_IFREG
+                ),
+            }
+        ),
+    )
+    monkeypatch.setattr(sdcard_watcher.os, "listdir", lambda _path: [CARD_A])
+
+    assert discover_card(config) is None
+
+
+def test_a_missing_by_uuid_directory_means_no_card(config, monkeypatch):
+    monkeypatch.setattr(
+        sdcard_watcher.os,
+        "stat",
+        stat_table(
+            {
+                str(config.card_mountpoint): FakeStat(dev=DEVICE_A),
+                str(config.card_mountpoint.parent): FakeStat(dev=1),
+            }
+        ),
+    )
+    assert discover_card(config) is None
+
+
+def test_a_missing_mountpoint_means_no_card(config):
+    missing = replace(config, card_mountpoint=config.card_mountpoint / "gone")
+    assert discover_card(missing) is None
 
 
 # --- Scanning scope -----------------------------------------------------------
@@ -218,180 +350,334 @@ def test_scanning_a_missing_mountpoint_raises_card_error(tmp_path):
         in_scope_files(tmp_path / "not-mounted")
 
 
-# --- Criterion 3: offline queueing --------------------------------------------
+# --- Offline queueing ---------------------------------------------------------
 
 
-def test_new_files_are_copied_into_the_queue_and_recorded_pending(
-    ready, card, ledger, watcher_logger
+def test_new_files_are_copied_into_the_cards_queue_and_recorded_pending(
+    ready, card, ledger, watcher_logger, mounted
 ):
+    mounted(MOUNTED_A)
     write_card_file(card, "logger-0001.csv", b"a,b\n1,2\n")
     write_card_file(card, "logger-0002.csv", b"c,d\n3,4\n")
 
-    result = ingest_card(ready, ledger, watcher_logger)
+    result = ingest_card(ready, ledger, watcher_logger, MOUNTED_A)
 
     assert (result.copied, result.rejected, result.failed) == (2, 0, 0)
     assert queued(ready) == ["logger-0001.csv", "logger-0002.csv"]
-    assert (ready.pending_dir / "logger-0001.csv").read_bytes() == b"a,b\n1,2\n"
-    assert ledger.filenames_with_status(STATUS_PENDING) == [
+    assert (ready.pending_dir_for(CARD_A) / "logger-0001.csv").read_bytes() == b"a,b\n1,2\n"
+    assert ledger.filenames_with_status(CARD_A, STATUS_PENDING) == [
         "logger-0001.csv",
         "logger-0002.csv",
     ]
 
 
-def test_ingestion_never_modifies_the_card(ready, card, ledger, watcher_logger):
+def test_the_per_card_directory_is_created_on_demand(ready, card, ledger, watcher_logger, mounted):
+    mounted(MOUNTED_A)
+    assert queued_cards(ready) == []
+
+    write_card_file(card, "a.csv")
+    ingest_card(ready, ledger, watcher_logger, MOUNTED_A)
+
+    assert queued_cards(ready) == [CARD_A]
+
+
+def test_ingestion_never_modifies_the_card(ready, card, ledger, watcher_logger, mounted):
+    mounted(MOUNTED_A)
     source = write_card_file(card, "logger-0001.csv", b"a,b\n1,2\n")
     before = (source.read_bytes(), sorted(os.listdir(card)))
 
-    ingest_card(ready, ledger, watcher_logger)
+    ingest_card(ready, ledger, watcher_logger, MOUNTED_A)
 
     assert (source.read_bytes(), sorted(os.listdir(card))) == before
 
 
-def test_out_of_scope_files_are_left_alone(ready, card, ledger, watcher_logger):
+def test_out_of_scope_files_are_left_alone(ready, card, ledger, watcher_logger, mounted):
+    mounted(MOUNTED_A)
     write_card_file(card, "notes.txt")
     (card / "nested").mkdir()
 
-    result = ingest_card(ready, ledger, watcher_logger)
+    result = ingest_card(ready, ledger, watcher_logger, MOUNTED_A)
 
     assert (result.copied, result.rejected, result.failed) == (0, 0, 0)
-    assert queued(ready) == []
+    assert queued_cards(ready) == []
 
 
-def test_an_empty_csv_is_copied(ready, card, ledger, watcher_logger):
+def test_an_empty_csv_is_copied(ready, card, ledger, watcher_logger, mounted):
+    mounted(MOUNTED_A)
     write_card_file(card, "empty.csv", b"")
 
-    assert ingest_card(ready, ledger, watcher_logger).copied == 1
-    assert (ready.pending_dir / "empty.csv").read_bytes() == b""
+    assert ingest_card(ready, ledger, watcher_logger, MOUNTED_A).copied == 1
+    assert (ready.pending_dir_for(CARD_A) / "empty.csv").read_bytes() == b""
 
 
-def test_a_file_exactly_at_the_limit_is_copied(ready, card, ledger, watcher_logger):
+def test_a_file_exactly_at_the_limit_is_copied(ready, card, ledger, watcher_logger, mounted):
+    mounted(MOUNTED_A)
     config = replace(ready, max_upload_bytes=64)
     write_card_file(card, "exact.csv", b"x" * 64)
 
-    assert ingest_card(config, ledger, watcher_logger).copied == 1
-    assert (config.pending_dir / "exact.csv").stat().st_size == 64
+    assert ingest_card(config, ledger, watcher_logger, MOUNTED_A).copied == 1
+    assert (config.pending_dir_for(CARD_A) / "exact.csv").stat().st_size == 64
 
 
 def test_a_file_one_byte_over_the_limit_is_rejected_and_not_queued(
-    ready, card, ledger, watcher_logger
+    ready, card, ledger, watcher_logger, mounted
 ):
+    mounted(MOUNTED_A)
     config = replace(ready, max_upload_bytes=64)
     write_card_file(card, "toobig.csv", b"x" * 65)
 
-    result = ingest_card(config, ledger, watcher_logger)
+    result = ingest_card(config, ledger, watcher_logger, MOUNTED_A)
 
     assert (result.copied, result.rejected) == (0, 1)
-    assert queued(config) == []
-    assert ledger.known_filenames() == set()
+    assert queued_cards(config) == []
+    assert ledger.known_filenames(CARD_A) == set()
 
 
-def test_an_unsafe_filename_is_rejected_and_not_queued(ready, card, ledger, watcher_logger):
+def test_an_unsafe_filename_is_rejected_and_not_queued(
+    ready, card, ledger, watcher_logger, mounted
+):
+    mounted(MOUNTED_A)
     write_card_file(card, "bad\nname.csv")
 
-    result = ingest_card(ready, ledger, watcher_logger)
+    result = ingest_card(ready, ledger, watcher_logger, MOUNTED_A)
 
     assert (result.copied, result.rejected) == (0, 1)
-    assert queued(ready) == []
+    assert queued_cards(ready) == []
 
 
 def test_a_rejected_file_does_not_stop_the_files_after_it(
-    ready, card, ledger, watcher_logger
+    ready, card, ledger, watcher_logger, mounted
 ):
+    mounted(MOUNTED_A)
     config = replace(ready, max_upload_bytes=64)
     write_card_file(card, "a-ok.csv", b"x" * 10)
     write_card_file(card, "b-toobig.csv", b"x" * 65)
     write_card_file(card, "c-ok.csv", b"x" * 10)
 
-    result = ingest_card(config, ledger, watcher_logger)
+    result = ingest_card(config, ledger, watcher_logger, MOUNTED_A)
 
     assert (result.copied, result.rejected) == (2, 1)
     assert queued(config) == ["a-ok.csv", "c-ok.csv"]
 
 
 def test_an_unreadable_file_is_reported_and_leaves_nothing_behind(
-    ready, card, ledger, watcher_logger
+    ready, card, ledger, watcher_logger, mounted
 ):
     """Stands in for a hot-unplug mid-copy: no partial file is published, the
-    ledger stays clean, and the next insertion retries."""
+    ledger stays clean, and the next scan retries."""
+    mounted(MOUNTED_A)
     source = write_card_file(card, "unreadable.csv", b"x" * 100)
     source.chmod(0o000)
     try:
-        result = ingest_card(ready, ledger, watcher_logger)
+        result = ingest_card(ready, ledger, watcher_logger, MOUNTED_A)
     finally:
         source.chmod(0o644)
 
     assert (result.copied, result.failed) == (0, 1)
-    assert queued(ready) == []
-    assert ledger.known_filenames() == set()
+    assert queued_cards(ready) == []
+    assert ledger.known_filenames(CARD_A) == set()
     assert list(os.scandir(ready.temp_dir)) == []
 
 
-def test_a_successful_copy_leaves_no_temporary_files(ready, card, ledger, watcher_logger):
+def test_a_successful_copy_leaves_no_temporary_files(
+    ready, card, ledger, watcher_logger, mounted
+):
+    mounted(MOUNTED_A)
     write_card_file(card, "a.csv")
-    ingest_card(ready, ledger, watcher_logger)
+    ingest_card(ready, ledger, watcher_logger, MOUNTED_A)
     assert list(os.scandir(ready.temp_dir)) == []
 
 
-def test_copy_into_queue_refuses_a_file_over_the_limit_while_reading(ready, card):
+def test_copy_into_queue_refuses_a_file_over_the_limit_while_reading(ready, card, mounted):
+    mounted(MOUNTED_A)
     config = replace(ready, max_upload_bytes=8)
     source = write_card_file(card, "big.csv", b"x" * 9)
 
     with pytest.raises(FileTooLarge):
-        copy_into_queue(source, config)
+        copy_into_queue(source, config, MOUNTED_A)
 
-    assert queued(config) == []
+    assert queued_cards(config) == []
     assert list(os.scandir(config.temp_dir)) == []
 
 
-# --- Criteria 5 and 6: reinsertion of a never-cleared card ---------------------
+# --- Criterion 5: mount-change safety -----------------------------------------
 
 
-def test_reinserting_the_card_after_upload_copies_nothing(
-    ready, card, ledger, watcher_logger
+def test_a_card_swap_during_a_copy_publishes_nothing(
+    ready, card, ledger, watcher_logger, mounted
 ):
-    """Criterion 5: the whole history is on the card, and none of it is re-copied."""
+    """Card A's bytes must never be filed under card B's identity."""
+    write_card_file(card, "logger-0001.csv", b"card a data\n")
+    # Present when the file is checked, replaced by the time the copy finishes.
+    mounted(MOUNTED_A, MOUNTED_B)
+
+    result = ingest_card(ready, ledger, watcher_logger, MOUNTED_A)
+
+    assert result.aborted is True
+    assert result.copied == 0
+    assert queued_cards(ready) == []
+    assert ledger.known_filenames(CARD_A) == set()
+    assert ledger.known_filenames(CARD_B) == set()
+    assert list(os.scandir(ready.temp_dir)) == []
+
+
+def test_a_card_removal_during_a_copy_publishes_nothing(
+    ready, card, ledger, watcher_logger, mounted
+):
     write_card_file(card, "logger-0001.csv")
-    ingest_card(ready, ledger, watcher_logger)
+    mounted(MOUNTED_A, None)
+
+    result = ingest_card(ready, ledger, watcher_logger, MOUNTED_A)
+
+    assert result.aborted is True
+    assert queued_cards(ready) == []
+    assert ledger.known_filenames(CARD_A) == set()
+
+
+def test_a_device_number_change_alone_aborts_the_copy(
+    ready, card, ledger, watcher_logger, mounted
+):
+    """Same UUID, different device: a re-plug mid-copy is still a change."""
+    write_card_file(card, "logger-0001.csv")
+    mounted(MOUNTED_A, CardIdentity(uuid=CARD_A, device_number=DEVICE_B))
+
+    result = ingest_card(ready, ledger, watcher_logger, MOUNTED_A)
+
+    assert result.aborted is True
+    assert queued_cards(ready) == []
+
+
+def test_copy_into_queue_raises_card_changed_and_cleans_up(ready, card, mounted):
+    mounted(MOUNTED_B)
+    source = write_card_file(card, "logger-0001.csv")
+
+    with pytest.raises(CardChanged):
+        copy_into_queue(source, ready, MOUNTED_A)
+
+    assert queued_cards(ready) == []
+    assert list(os.scandir(ready.temp_dir)) == []
+
+
+def test_a_swap_between_files_stops_the_scan_before_the_next_copy(
+    ready, card, ledger, watcher_logger, mounted
+):
+    write_card_file(card, "a.csv")
+    write_card_file(card, "b.csv")
+    # a.csv: pre-check A, post-copy A. b.csv: pre-check B -> stop.
+    mounted(MOUNTED_A, MOUNTED_A, MOUNTED_B)
+
+    result = ingest_card(ready, ledger, watcher_logger, MOUNTED_A)
+
+    assert (result.copied, result.aborted) == (1, True)
+    assert queued(ready) == ["a.csv"]
+    assert ledger.known_filenames(CARD_A) == {"a.csv"}
+
+
+def test_the_aborted_file_is_queued_on_a_later_scan(
+    ready, card, ledger, watcher_logger, mounted
+):
+    write_card_file(card, "logger-0001.csv", b"card a data\n")
+    mounted(MOUNTED_A, MOUNTED_B)
+    assert ingest_card(ready, ledger, watcher_logger, MOUNTED_A).aborted is True
+
+    mounted(MOUNTED_A)
+    result = ingest_card(ready, ledger, watcher_logger, MOUNTED_A)
+
+    assert result.copied == 1
+    assert (ready.pending_dir_for(CARD_A) / "logger-0001.csv").read_bytes() == b"card a data\n"
+
+
+# --- Criterion 6: per-card local identity -------------------------------------
+
+
+def test_the_same_filename_from_two_cards_produces_two_queued_files(
+    ready, card, ledger, watcher_logger, mounted
+):
+    """The motivating scenario: both files must survive and both must ship."""
+    write_card_file(card, "logger-0001.csv", b"card a data\n")
+    mounted(MOUNTED_A)
+    ingest_card(ready, ledger, watcher_logger, MOUNTED_A)
+
+    # Card A removed, card B inserted with a same-named, different file.
+    (card / "logger-0001.csv").write_bytes(b"card b data\n")
+    mounted(MOUNTED_B)
+    result = ingest_card(ready, ledger, watcher_logger, MOUNTED_B)
+
+    assert result.copied == 1
+    assert queued_cards(ready) == sorted([CARD_A, CARD_B])
+    assert (ready.pending_dir_for(CARD_A) / "logger-0001.csv").read_bytes() == b"card a data\n"
+    assert (ready.pending_dir_for(CARD_B) / "logger-0001.csv").read_bytes() == b"card b data\n"
+    assert ledger.status_of(CARD_A, "logger-0001.csv") == STATUS_PENDING
+    assert ledger.status_of(CARD_B, "logger-0001.csv") == STATUS_PENDING
+
+
+def test_reinserting_a_card_after_upload_copies_nothing(
+    ready, card, ledger, watcher_logger, mounted
+):
+    """The whole history is on the card, and none of it is re-copied."""
+    mounted(MOUNTED_A)
+    write_card_file(card, "logger-0001.csv")
+    ingest_card(ready, ledger, watcher_logger, MOUNTED_A)
 
     # The uploader delivers the file and clears the queued copy.
-    ledger.mark_uploaded("logger-0001.csv")
-    (ready.pending_dir / "logger-0001.csv").unlink()
+    ledger.mark_uploaded(CARD_A, "logger-0001.csv")
+    (ready.pending_dir_for(CARD_A) / "logger-0001.csv").unlink()
 
-    result = ingest_card(ready, ledger, watcher_logger)
+    result = ingest_card(ready, ledger, watcher_logger, MOUNTED_A)
 
     assert (result.copied, result.skipped_known) == (0, 1)
     assert queued(ready) == []
-    assert ledger.status_of("logger-0001.csv") == STATUS_UPLOADED
+    assert ledger.status_of(CARD_A, "logger-0001.csv") == STATUS_UPLOADED
 
 
-def test_reinserting_the_card_before_upload_makes_no_duplicate_copy(
-    ready, card, ledger, watcher_logger
+def test_reinserting_a_card_before_upload_makes_no_duplicate_copy(
+    ready, card, ledger, watcher_logger, mounted
 ):
-    """Criterion 6: a `pending` row is honoured, so the queue keeps one copy."""
+    """A `pending` row is honoured, so the queue keeps one copy."""
+    mounted(MOUNTED_A)
     write_card_file(card, "logger-0001.csv")
-    ingest_card(ready, ledger, watcher_logger)
+    ingest_card(ready, ledger, watcher_logger, MOUNTED_A)
 
-    result = ingest_card(ready, ledger, watcher_logger)
+    result = ingest_card(ready, ledger, watcher_logger, MOUNTED_A)
 
     assert (result.copied, result.skipped_known) == (0, 1)
     assert queued(ready) == ["logger-0001.csv"]
-    assert ledger.status_of("logger-0001.csv") == STATUS_PENDING
+    assert ledger.status_of(CARD_A, "logger-0001.csv") == STATUS_PENDING
 
 
 def test_reinsertion_with_new_files_copies_only_the_new_ones(
-    ready, card, ledger, watcher_logger
+    ready, card, ledger, watcher_logger, mounted
 ):
+    mounted(MOUNTED_A)
     write_card_file(card, "logger-0001.csv")
-    ingest_card(ready, ledger, watcher_logger)
-    ledger.mark_uploaded("logger-0001.csv")
-    (ready.pending_dir / "logger-0001.csv").unlink()
+    ingest_card(ready, ledger, watcher_logger, MOUNTED_A)
+    ledger.mark_uploaded(CARD_A, "logger-0001.csv")
+    (ready.pending_dir_for(CARD_A) / "logger-0001.csv").unlink()
 
     # The logger appends nothing; it writes a new, distinct name.
     write_card_file(card, "logger-0002.csv")
-    result = ingest_card(ready, ledger, watcher_logger)
+    result = ingest_card(ready, ledger, watcher_logger, MOUNTED_A)
 
     assert (result.copied, result.skipped_known) == (1, 1)
     assert queued(ready) == ["logger-0002.csv"]
+
+
+def test_dedup_from_one_card_never_suppresses_another_cards_file(
+    ready, card, ledger, watcher_logger, mounted
+):
+    """Card A's uploaded filename must not make card B's look already known."""
+    mounted(MOUNTED_A)
+    write_card_file(card, "logger-0001.csv", b"card a data\n")
+    ingest_card(ready, ledger, watcher_logger, MOUNTED_A)
+    ledger.mark_uploaded(CARD_A, "logger-0001.csv")
+    (ready.pending_dir_for(CARD_A) / "logger-0001.csv").unlink()
+
+    (card / "logger-0001.csv").write_bytes(b"card b data\n")
+    mounted(MOUNTED_B)
+    result = ingest_card(ready, ledger, watcher_logger, MOUNTED_B)
+
+    assert (result.copied, result.skipped_known) == (1, 0)
+    assert (ready.pending_dir_for(CARD_B) / "logger-0001.csv").read_bytes() == b"card b data\n"
 
 
 # --- Stale temporary files ----------------------------------------------------
@@ -405,7 +691,8 @@ def test_stale_temporary_copies_are_cleared_at_start_up(ready, watcher_logger):
 
 
 def test_clearing_temporary_copies_never_touches_the_queue(ready, watcher_logger):
-    (ready.pending_dir / "a.csv").write_bytes(b"real")
+    ready.pending_dir_for(CARD_A).mkdir(parents=True)
+    (ready.pending_dir_for(CARD_A) / "a.csv").write_bytes(b"real")
 
     clear_stale_temp_files(ready, watcher_logger)
 
@@ -421,71 +708,66 @@ def test_prepare_directories_is_idempotent(config, ledger):
 # --- The watch loop -----------------------------------------------------------
 
 
-def _mounted(config, monkeypatch, device=Path("/dev/sda1")):
-    monkeypatch.setattr(sdcard_watcher, "card_device", lambda _config: device)
-    monkeypatch.setattr(sdcard_watcher, "card_is_mounted", lambda _config, _device: True)
-
-
-def test_an_absent_card_is_not_scanned(ready, ledger, watcher_logger, monkeypatch, caplog):
-    monkeypatch.setattr(sdcard_watcher, "card_device", lambda _config: None)
+def test_an_absent_card_is_not_scanned(ready, ledger, watcher_logger, mounted, caplog):
+    mounted(None)
     state = StateLogger(watcher_logger, 300.0)
 
-    assert check_once(ready, ledger, watcher_logger, state, False) is False
-    assert "not inserted" in caplog.text
+    assert check_once(ready, ledger, watcher_logger, state) is False
+    assert "no card is mounted" in caplog.text
 
 
-def test_a_present_but_unmounted_card_is_not_scanned(
+def test_a_mount_without_a_resolvable_uuid_is_not_scanned(
     ready, card, ledger, watcher_logger, monkeypatch, caplog
 ):
+    """Criterion 4: a mounted device whose UUID does not resolve safely is not
+    ingested, and nothing is written."""
     write_card_file(card, "a.csv")
-    monkeypatch.setattr(sdcard_watcher, "card_device", lambda _config: Path("/dev/sda1"))
-    monkeypatch.setattr(sdcard_watcher, "card_is_mounted", lambda _config, _device: False)
+    monkeypatch.setattr(sdcard_watcher, "discover_card", lambda _config: None)
+    monkeypatch.setattr(sdcard_watcher, "is_mount_boundary", lambda _mountpoint: True)
     state = StateLogger(watcher_logger, 300.0)
 
-    assert check_once(ready, ledger, watcher_logger, state, False) is False
-    assert queued(ready) == []
-    assert "not mounted" in caplog.text
+    assert check_once(ready, ledger, watcher_logger, state) is False
+    assert queued_cards(ready) == []
+    assert ledger.counts() == {}
+    assert "no safe card UUID" in caplog.text
 
 
-def test_insertion_triggers_exactly_one_ingest(
-    ready, card, ledger, watcher_logger, monkeypatch
-):
+def test_a_mounted_card_is_scanned_on_every_tick(ready, card, ledger, watcher_logger, mounted):
+    """Phase 3 drops insertion-transition state: each tick re-scans, and ledger
+    dedup makes the repeat free."""
+    mounted(MOUNTED_A)
     write_card_file(card, "a.csv")
-    _mounted(ready, monkeypatch)
     state = StateLogger(watcher_logger, 300.0)
 
-    present = check_once(ready, ledger, watcher_logger, state, False)
-    assert present is True
+    assert check_once(ready, ledger, watcher_logger, state) is True
     assert queued(ready) == ["a.csv"]
 
-    # A card that stays inserted is not re-scanned every tick.
+    # A file added while the card stays in place is picked up without a re-plug.
     write_card_file(card, "b.csv")
-    assert check_once(ready, ledger, watcher_logger, state, present) is True
-    assert queued(ready) == ["a.csv"]
-
-
-def test_removing_and_reinserting_the_card_scans_again(
-    ready, card, ledger, watcher_logger, monkeypatch
-):
-    write_card_file(card, "a.csv")
-    _mounted(ready, monkeypatch)
-    state = StateLogger(watcher_logger, 300.0)
-
-    check_once(ready, ledger, watcher_logger, state, False)
-    write_card_file(card, "b.csv")
-
-    # Removal, then reinsertion: presence goes False, so the next check scans.
-    monkeypatch.setattr(sdcard_watcher, "card_device", lambda _config: None)
-    assert check_once(ready, ledger, watcher_logger, state, True) is False
-    _mounted(ready, monkeypatch)
-    assert check_once(ready, ledger, watcher_logger, state, False) is True
-
+    assert check_once(ready, ledger, watcher_logger, state) is True
     assert queued(ready) == ["a.csv", "b.csv"]
 
 
-def test_a_scan_failure_does_not_crash_the_loop(ready, ledger, watcher_logger, monkeypatch, caplog):
-    monkeypatch.setattr(sdcard_watcher, "card_device", lambda _config: Path("/dev/sda1"))
-    monkeypatch.setattr(sdcard_watcher, "card_is_mounted", lambda _config, _device: True)
+def test_swapping_cards_between_ticks_ingests_both(
+    ready, card, ledger, watcher_logger, mounted
+):
+    state = StateLogger(watcher_logger, 300.0)
+    write_card_file(card, "logger-0001.csv", b"card a data\n")
+    mounted(MOUNTED_A)
+    check_once(ready, ledger, watcher_logger, state)
+
+    (card / "logger-0001.csv").write_bytes(b"card b data\n")
+    mounted(MOUNTED_B)
+    check_once(ready, ledger, watcher_logger, state)
+
+    assert queued(ready, CARD_A) == ["logger-0001.csv"]
+    assert queued(ready, CARD_B) == ["logger-0001.csv"]
+
+
+def test_a_scan_failure_does_not_crash_the_loop(
+    ready, ledger, watcher_logger, mounted, monkeypatch, caplog
+):
+    mounted(MOUNTED_A)
 
     def broken(*args, **kwargs):
         raise CardError("cannot list the mountpoint")
@@ -493,14 +775,14 @@ def test_a_scan_failure_does_not_crash_the_loop(ready, ledger, watcher_logger, m
     monkeypatch.setattr(sdcard_watcher, "ingest_card", broken)
     state = StateLogger(watcher_logger, 300.0)
 
-    assert check_once(ready, ledger, watcher_logger, state, False) is False
+    assert check_once(ready, ledger, watcher_logger, state) is False
     assert "cannot list the mountpoint" in caplog.text
 
 
 def test_an_unexpected_ingest_error_does_not_crash_the_loop(
-    ready, ledger, watcher_logger, monkeypatch, caplog
+    ready, ledger, watcher_logger, mounted, monkeypatch, caplog
 ):
-    _mounted(ready, monkeypatch)
+    mounted(MOUNTED_A)
 
     def explode(*args, **kwargs):
         raise ValueError("something unforeseen")
@@ -508,12 +790,12 @@ def test_an_unexpected_ingest_error_does_not_crash_the_loop(
     monkeypatch.setattr(sdcard_watcher, "ingest_card", explode)
     state = StateLogger(watcher_logger, 300.0)
 
-    check_once(ready, ledger, watcher_logger, state, False)
-    assert "unexpected error ingesting the card" in caplog.text
+    assert check_once(ready, ledger, watcher_logger, state) is False
+    assert "unexpected error ingesting card" in caplog.text
 
 
-def test_run_stops_after_the_requested_iterations(ready, ledger, watcher_logger, monkeypatch):
-    _mounted(ready, monkeypatch)
+def test_run_stops_after_the_requested_iterations(ready, ledger, watcher_logger, mounted):
+    mounted(MOUNTED_A)
     state = StateLogger(watcher_logger, 300.0)
     quick = replace(ready, scan_interval_seconds=0.01)
 
@@ -524,8 +806,8 @@ def test_run_stops_after_the_requested_iterations(ready, ledger, watcher_logger,
     assert iterations == 2
 
 
-def test_run_does_nothing_when_already_stopped(ready, ledger, watcher_logger, monkeypatch):
-    _mounted(ready, monkeypatch)
+def test_run_does_nothing_when_already_stopped(ready, ledger, watcher_logger, mounted):
+    mounted(MOUNTED_A)
     stop_event = threading.Event()
     stop_event.set()
 
@@ -534,11 +816,12 @@ def test_run_does_nothing_when_already_stopped(ready, ledger, watcher_logger, mo
     assert iterations == 0
 
 
-def test_run_ingests_an_already_inserted_card_on_the_first_tick(
-    ready, card, ledger, watcher_logger, monkeypatch
+def test_run_ingests_a_card_that_was_already_mounted_at_start_up(
+    ready, card, ledger, watcher_logger, mounted
 ):
+    """Criterion 3: a card present at boot needs no insertion event."""
+    mounted(MOUNTED_A)
     write_card_file(card, "a.csv")
-    _mounted(ready, monkeypatch)
 
     run(
         ready,

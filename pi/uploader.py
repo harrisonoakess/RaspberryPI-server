@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 2 upload daemon for the Raspberry Pi.
+"""Upload daemon for the Raspberry Pi.
 
 Evolves Phase 1's connectivity daemon. One non-overlapping poll loop; every
 tick it asks the OS whether the configured WiFi interface is associated with an
@@ -10,16 +10,22 @@ access point. While connected it:
 2. uploads every file `sdcard_watcher` has queued, promptly and independently
    of the heartbeat.
 
+The queue is namespaced per card: `queue/pending/<card_uuid>/<filename>`. Each
+queued entry is delivered under the logical identity
+`(device_id, card_uuid, filename)`, so two cards carrying the same filename are
+two distinct files rather than one file uploaded twice.
+
 Delivery is at least once. A queued file is marked `uploaded` and deleted only
 after the server returns a `200` whose acknowledgement exactly matches the
-`device_id`, `filename`, and byte size that were sent. Anything else leaves the
-file pending for a later tick. The server's `UNIQUE (device_id, filename)`
-constraint turns repeated attempts into one stored blob and one row.
+`device_id`, `card_uuid`, `filename`, and byte size that were sent. Anything
+else leaves the file pending for a later tick. The server's
+`UNIQUE (device_id, card_uuid, filename)` constraint turns repeated attempts
+into one stored blob and one row.
 
 Errors never stop the loop, and repeated identical states are rate-limited so
 an offline Pi cannot flood the journal.
 
-Standard library only. See prd/phase-2-data-sync.md.
+Standard library only. See prd/phase-3-multi-card-ingestion.md.
 """
 
 from __future__ import annotations
@@ -53,6 +59,12 @@ LOGGER_NAME = "piuploader"
 # Must match the server's device_id validation in server/main.py.
 DEVICE_ID_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
+# Must match the server's card_uuid validation in server/main.py. Deliberately
+# an opaque safe token rather than a UUID shape: vfat/exfat cards expose short
+# blkid-style ids (A1B2-C3D4) while ext2/ext3/ext4 expose full RFC 4122 UUIDs.
+# `\A`/`\Z` rather than `^`/`$`, so a trailing newline cannot slip through.
+CARD_UUID_PATTERN = re.compile(r"\A[A-Za-z0-9-]{1,64}\Z")
+
 # Mirrors server/main.py's filename rules. Deliberately duplicated rather than
 # shared: the Pi and the server are independent deployables coupled only by the
 # HTTP contract, and the Pi must not send a name the server would reject.
@@ -65,7 +77,7 @@ DEFAULT_LOG_BACKUP_COUNT = 5
 
 DEFAULT_QUEUE_PATH = Path("/var/lib/piuploader/queue")
 DEFAULT_STATE_DB_PATH = Path("/var/lib/piuploader/state.db")
-DEFAULT_MAX_UPLOAD_BYTES = 10_485_760  # 10 MiB, matched on the server.
+DEFAULT_MAX_UPLOAD_BYTES = 20_971_520  # 20 MiB, matched on the server.
 
 # The `filename` form field is authoritative (PRD §5.3); the file part's own
 # filename attribute is informational, so a fixed value is sent and no real
@@ -133,6 +145,10 @@ class Config:
     @property
     def pending_dir(self) -> Path:
         return self.queue_path / "pending"
+
+    def pending_dir_for(self, card_uuid: str) -> Path:
+        """The per-card queue directory. Callers validate `card_uuid` first."""
+        return self.pending_dir / card_uuid
 
     @staticmethod
     def from_env(env: Optional[dict] = None) -> "Config":
@@ -237,6 +253,18 @@ def is_safe_filename(name: str) -> bool:
     if os.path.basename(name) != name or os.path.dirname(name):
         return False
     return name.lower().endswith(".csv")
+
+
+def is_safe_card_uuid(value: str) -> bool:
+    """Whether `value` is a filesystem UUID safe to use as a path segment.
+
+    Same whitelist reasoning as `is_safe_filename`: the token either passes
+    as-is or is rejected, and it is the only card-derived value that is ever
+    joined to the queue path or sent to the server.
+    """
+    if not isinstance(value, str):
+        return False
+    return CARD_UUID_PATTERN.match(value) is not None
 
 
 class StateLogger:
@@ -440,7 +468,9 @@ def send_ping(
     return parsed
 
 
-def build_multipart(device_id: str, filename: str, content: bytes) -> tuple:
+def build_multipart(
+    device_id: str, card_uuid: str, filename: str, content: bytes
+) -> tuple:
     """Build the `POST /upload` body. Returns `(body, content_type)`.
 
     The boundary is random and re-drawn if it happens to occur in the payload,
@@ -452,7 +482,11 @@ def build_multipart(device_id: str, filename: str, content: bytes) -> tuple:
             break
 
     parts = []
-    for name, value in (("device_id", device_id), ("filename", filename)):
+    for name, value in (
+        ("device_id", device_id),
+        ("card_uuid", card_uuid),
+        ("filename", filename),
+    ):
         parts.append(
             f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'.encode(
                 "utf-8"
@@ -477,6 +511,7 @@ def build_multipart(device_id: str, filename: str, content: bytes) -> tuple:
 def send_upload(
     config: Config,
     device_id: str,
+    card_uuid: str,
     filename: str,
     content: bytes,
     opener: Optional[urllib.request.OpenerDirector] = None,
@@ -486,6 +521,8 @@ def send_upload(
     Only an acknowledgement that matches everything sent is accepted, because
     that acknowledgement is the sole evidence used to delete the local copy.
     """
+    if not is_safe_card_uuid(card_uuid):
+        raise UploadError("unsafe_card_uuid", f"refusing to send card_uuid {card_uuid!r}")
     if not is_safe_filename(filename):
         raise UploadError("unsafe_filename", f"refusing to send filename {filename!r}")
     if len(content) > config.max_upload_bytes:
@@ -496,7 +533,7 @@ def send_upload(
         )
 
     opener = opener if opener is not None else _build_opener()
-    body, content_type = build_multipart(device_id, filename, content)
+    body, content_type = build_multipart(device_id, card_uuid, filename, content)
     request = urllib.request.Request(
         config.upload_url,
         data=body,
@@ -532,6 +569,8 @@ def send_upload(
         )
     if parsed.get("device_id") != device_id:
         raise UploadError("mismatched_ack", "acknowledged a different device_id")
+    if parsed.get("card_uuid") != card_uuid:
+        raise UploadError("mismatched_ack", "acknowledged a different card_uuid")
     if parsed.get("filename") != filename:
         raise UploadError("mismatched_ack", "acknowledged a different filename")
     if parsed.get("size") != len(content):
@@ -559,18 +598,62 @@ class UploadBatch:
         )
 
 
-def queued_filenames(config: Config) -> list:
-    """Names waiting in `queue/pending/`, sorted oldest-name-first.
+@dataclass
+class QueueScan:
+    """What one pass over `queue/pending/` found.
 
-    The queue directory is the source of truth for what to send; the ledger
-    records what the Pi already has. A missing directory simply means nothing
-    has been queued yet.
+    `entries` are the `(card_uuid, filename)` pairs to attempt, in stable
+    order. `skipped` names anything that is not a two-level regular file, which
+    is left untouched on disk and only reported.
+    """
+
+    entries: list
+    skipped: list
+
+
+def scan_pending(config: Config) -> QueueScan:
+    """Enumerate `queue/pending/<card_uuid>/<filename>` entries.
+
+    Exactly two levels: a per-card directory holding regular files. Symlinks
+    are never followed — neither a symlinked card directory nor a symlinked
+    queue entry — so nothing outside the queue can be read or sent. A missing
+    directory simply means nothing has been queued yet.
     """
     try:
-        entries = list(os.scandir(config.pending_dir))
+        top_level = list(os.scandir(config.pending_dir))
     except FileNotFoundError:
-        return []
-    return sorted(entry.name for entry in entries if entry.is_file(follow_symlinks=False))
+        return QueueScan(entries=[], skipped=[])
+
+    entries = []
+    skipped = []
+    for card_entry in top_level:
+        try:
+            if not card_entry.is_dir(follow_symlinks=False):
+                # A flat file here is either debris or Phase 2 queue state; it
+                # has no card identity, so it cannot be uploaded.
+                skipped.append(card_entry.name)
+                continue
+            children = list(os.scandir(card_entry.path))
+        except OSError:
+            skipped.append(card_entry.name)
+            continue
+
+        for entry in children:
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    skipped.append(f"{card_entry.name}/{entry.name}")
+                    continue
+            except OSError:
+                skipped.append(f"{card_entry.name}/{entry.name}")
+                continue
+            entries.append((card_entry.name, entry.name))
+
+    return QueueScan(entries=sorted(entries), skipped=sorted(skipped))
+
+
+def queued_entries(config: Config) -> list:
+    """The `(card_uuid, filename)` pairs waiting to be uploaded."""
+    return scan_pending(config).entries
 
 
 def upload_pending(
@@ -589,7 +672,7 @@ def upload_pending(
     logger = state_logger.logger
 
     try:
-        names = queued_filenames(config)
+        scan = scan_pending(config)
     except OSError as exc:
         state_logger.record(
             CATEGORY_QUEUE_READ_FAILED,
@@ -598,20 +681,31 @@ def upload_pending(
         )
         return batch
 
-    for name in names:
-        path = config.pending_dir / name
+    for name in scan.skipped:
+        # Left in place rather than deleted, because destroying data is worse
+        # than a repeated log line.
+        state_logger.record(
+            CATEGORY_UPLOAD_PREFIX + "malformed_queue_entry",
+            f"skipping queue entry {name!r}: not a pending/<card_uuid>/<filename> file",
+            level=logging.ERROR,
+        )
+        batch.rejected += 1
 
-        if not is_safe_filename(name):
-            # Cannot have come from the watcher; left in place rather than
-            # deleted, because destroying data is worse than a repeated log.
+    for card_uuid, name in scan.entries:
+        label = f"{card_uuid}/{name}"
+
+        if not is_safe_card_uuid(card_uuid) or not is_safe_filename(name):
+            # Cannot have come from the watcher; both path segments are
+            # validated before either is joined to a path or sent.
             state_logger.record(
-                CATEGORY_UPLOAD_PREFIX + "unsafe_filename",
-                f"skipping queued file with an unsafe name {name!r}",
+                CATEGORY_UPLOAD_PREFIX + "unsafe_queue_entry",
+                f"skipping queued file with an unsafe path {label!r}",
                 level=logging.ERROR,
             )
             batch.rejected += 1
             continue
 
+        path = config.pending_dir_for(card_uuid) / name
         try:
             content = path.read_bytes()
         except FileNotFoundError:
@@ -620,7 +714,7 @@ def upload_pending(
         except OSError as exc:
             state_logger.record(
                 CATEGORY_UPLOAD_PREFIX + "read_failed",
-                f"cannot read queued file {name!r}: {exc}",
+                f"cannot read queued file {label!r}: {exc}",
                 level=logging.ERROR,
             )
             batch.failed += 1
@@ -628,14 +722,16 @@ def upload_pending(
 
         batch.attempted += 1
         try:
-            acknowledgement = send_upload(config, device_id, name, content, opener=opener)
+            acknowledgement = send_upload(
+                config, device_id, card_uuid, name, content, opener=opener
+            )
         except UploadError as exc:
             state_logger.record(
                 CATEGORY_UPLOAD_PREFIX + exc.category,
-                f"upload of {name!r} failed [{exc.category}]: {exc}",
+                f"upload of {label!r} failed [{exc.category}]: {exc}",
                 level=logging.ERROR,
             )
-            if exc.category in ("unsafe_filename", "too_large"):
+            if exc.category in ("unsafe_filename", "unsafe_card_uuid", "too_large"):
                 batch.rejected += 1
             else:
                 batch.failed += 1
@@ -643,7 +739,7 @@ def upload_pending(
         except Exception as exc:
             state_logger.record(
                 CATEGORY_UPLOAD_PREFIX + "unexpected_error",
-                f"unexpected error uploading {name!r}: {exc!r}",
+                f"unexpected error uploading {label!r}: {exc!r}",
                 level=logging.ERROR,
             )
             batch.failed += 1
@@ -652,11 +748,13 @@ def upload_pending(
         # Ledger first, then the file: a crash in between leaves an extra
         # queued copy that is re-sent and answered with `already_stored`,
         # whereas the reverse order could lose the record of a delivered file.
-        ledger.mark_uploaded(name)
+        ledger.mark_uploaded(card_uuid, name)
         try:
             path.unlink()
         except OSError as exc:  # pragma: no cover - defensive
-            logger.warning("uploaded %r but could not remove the queued copy: %s", name, exc)
+            logger.warning("uploaded %r but could not remove the queued copy: %s", label, exc)
+        else:
+            _remove_empty_card_dir(path.parent)
 
         if acknowledgement.get("status") == "already_stored":
             batch.already_stored += 1
@@ -664,8 +762,9 @@ def upload_pending(
             batch.uploaded += 1
         state_logger.record(
             CATEGORY_UPLOAD_PREFIX + "stored",
-            "upload {}: filename={} size={} received_at={}".format(
+            "upload {}: card_uuid={} filename={} size={} received_at={}".format(
                 acknowledgement.get("status"),
+                card_uuid,
                 name,
                 acknowledgement.get("size"),
                 acknowledgement.get("received_at"),
@@ -675,6 +774,19 @@ def upload_pending(
         )
 
     return batch
+
+
+def _remove_empty_card_dir(directory: Path) -> None:
+    """Drop a per-card queue directory once its last file is delivered.
+
+    Never forced: a non-empty directory raises OSError and is left alone. The
+    watcher re-creates the directory immediately before it publishes a copy, so
+    removing it here cannot lose a file.
+    """
+    try:
+        directory.rmdir()
+    except OSError:
+        pass
 
 
 def send_heartbeat(
@@ -880,7 +992,7 @@ def main(argv: Optional[list] = None) -> int:
     logger.info(
         "ledger holds %s; %d file(s) queued",
         summarize(ledger.counts()),
-        len(queued_filenames(config)),
+        len(queued_entries(config)),
     )
 
     stop_event = threading.Event()

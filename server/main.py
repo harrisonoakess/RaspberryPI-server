@@ -1,10 +1,15 @@
 """Pi ingest server: POST /ping, POST /upload, and GET /health.
 
 Persists one row per accepted ping, and one blob plus one row per accepted
-`(device_id, filename)` upload, into a Railway volume so both survive process
-restarts, container restarts, and redeployments.
+`(device_id, card_uuid, filename)` upload, into a Railway volume so both
+survive process restarts, container restarts, and redeployments.
 
-See prd/phase-1-connection.md and prd/phase-2-data-sync.md.
+The `card_uuid` segment is what lets one Pi deliver files from several SD cards
+over its lifetime: two cards can each carry a `logger-0001.csv`, and those are
+two distinct files, not one file uploaded twice.
+
+See prd/phase-1-connection.md, prd/phase-2-data-sync.md, and
+prd/phase-3-multi-card-ingestion.md.
 """
 
 from __future__ import annotations
@@ -13,6 +18,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import tempfile
 import unicodedata
@@ -31,13 +37,22 @@ logger = logging.getLogger("piserver")
 # Hostname-style identifier: 1-63 chars, alphanumeric start and end, internal hyphens.
 DEVICE_ID_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
+# Filesystem UUID of the SD card a file came from, validated as an opaque safe
+# token rather than a strict UUID shape: vfat/exfat cards expose short
+# blkid-style ids (A1B2-C3D4) while ext2/ext3/ext4 expose full RFC 4122 UUIDs.
+# `\A`/`\Z` rather than `^`/`$`, so a trailing newline cannot slip through into
+# a path segment. Comparison is case-sensitive: the Pi sends the exact token
+# exposed under /dev/disk/by-uuid.
+CARD_UUID_PATTERN = re.compile(r"\A[A-Za-z0-9-]{1,64}\Z")
+MAX_CARD_UUID_CHARACTERS = 64
+
 # RFC 3339 timestamp restricted to UTC ("Z" or a zero offset).
 RFC3339_UTC_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]00:00)$"
 )
 
 # Phase 2 upload limits. The Pi enforces the same ceiling before it queues a file.
-DEFAULT_MAX_UPLOAD_BYTES = 10_485_760  # 10 MiB
+DEFAULT_MAX_UPLOAD_BYTES = 20_971_520  # 20 MiB
 MAX_FILENAME_CHARACTERS = 255
 # ext4/vfat cap a name at 255 *bytes*; a longer name would fail at open() with
 # ENAMETOOLONG, so reject it as a bad request instead of a server error.
@@ -47,24 +62,38 @@ UPLOAD_CHUNK_BYTES = 262_144
 # rejecting an oversized request from its Content-Length alone.
 MULTIPART_ENVELOPE_ALLOWANCE = 65_536
 
-SCHEMA = """
+PINGS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS pings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     device_id TEXT NOT NULL,
     sent_at TEXT NOT NULL,
     received_at TEXT NOT NULL
 );
+"""
 
+# Kept separate from PINGS_SCHEMA because the one-time Phase 2 -> Phase 3 reset
+# recreates this table alone and must leave the ping history untouched.
+UPLOADS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS uploads (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     device_id TEXT NOT NULL,
+    card_uuid TEXT NOT NULL,
     filename TEXT NOT NULL,
     stored_path TEXT NOT NULL,
     size INTEGER NOT NULL,
     received_at TEXT NOT NULL,
-    UNIQUE (device_id, filename)
+    UNIQUE (device_id, card_uuid, filename)
 );
 """
+
+SCHEMA = PINGS_SCHEMA + UPLOADS_SCHEMA
+
+# Phase 2 kept `UNIQUE (device_id, filename)` and no card column, so its rows
+# and blobs cannot be read under the Phase 3 identity. Startup refuses to serve
+# such a database unless the operator explicitly asks for the reset.
+UPLOADS_SCHEMA_ABSENT = "absent"
+UPLOADS_SCHEMA_LEGACY = "legacy"
+UPLOADS_SCHEMA_PHASE3 = "phase3"
 
 
 @dataclass(frozen=True)
@@ -75,6 +104,9 @@ class Settings:
     database_path: Path
     uploads_path: Optional[Path] = None
     max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES
+    # One-time Phase 2 -> Phase 3 authorization. A no-op once the uploads table
+    # already has the Phase 3 schema, so leaving it set cannot destroy new data.
+    reset_uploads: bool = False
 
     @property
     def uploads_root(self) -> Path:
@@ -95,6 +127,7 @@ class Settings:
             database_path=resolve_database_path(env),
             uploads_path=resolve_uploads_path(env),
             max_upload_bytes=resolve_max_upload_bytes(env),
+            reset_uploads=resolve_reset_uploads(env),
         )
 
 
@@ -145,6 +178,11 @@ def resolve_max_upload_bytes(env: dict) -> int:
     if value < 0:
         raise ValueError(f"MAX_UPLOAD_BYTES must not be negative, got {raw!r}")
     return value
+
+
+def resolve_reset_uploads(env: dict) -> bool:
+    """Whether `PHASE3_RESET_UPLOADS` authorizes the one-time uploads reset."""
+    return env.get("PHASE3_RESET_UPLOADS", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def rfc3339_utc(moment: datetime) -> str:
@@ -207,6 +245,7 @@ class PingResponse(BaseModel):
 class UploadResponse(BaseModel):
     status: str
     device_id: str
+    card_uuid: str
     filename: str
     size: int
     received_at: str
@@ -248,6 +287,28 @@ def validate_filename(value: str) -> str:
     return value
 
 
+def validate_card_uuid(value: str) -> str:
+    """Return `value` if it is a safe card identity token, else raise.
+
+    Like `validate_filename`, this is a whitelist of shapes rather than a
+    sanitizer, and it has to hold before the value becomes a path segment under
+    the uploads root. The alphabet (letters, digits, hyphen) admits both
+    `blkid` short ids and full RFC 4122 UUIDs while excluding separators, dots,
+    NUL, and control characters outright.
+    """
+    if not isinstance(value, str):
+        raise ValueError("card_uuid must be text")
+    if not CARD_UUID_PATTERN.match(value):
+        raise ValueError(
+            f"card_uuid must be 1-{MAX_CARD_UUID_CHARACTERS} characters of letters, "
+            "numbers, and hyphens"
+        )
+    # Defence in depth: after the rule above these are equalities, not fixes.
+    if os.path.basename(value) != value or os.path.dirname(value):
+        raise ValueError("card_uuid must be a single path segment")
+    return value
+
+
 def connect(database_path: Path) -> sqlite3.Connection:
     """Open a durable SQLite connection.
 
@@ -262,6 +323,45 @@ def connect(database_path: Path) -> sqlite3.Connection:
     return connection
 
 
+def uploads_schema_state(database_path: Path) -> str:
+    """Classify an existing `uploads` table as Phase 2 (`legacy`) or Phase 3."""
+    if not Path(database_path).exists():
+        return UPLOADS_SCHEMA_ABSENT
+    with closing(connect(database_path)) as connection:
+        columns = [row[1] for row in connection.execute("PRAGMA table_info(uploads)")]
+    if not columns:
+        return UPLOADS_SCHEMA_ABSENT
+    return UPLOADS_SCHEMA_PHASE3 if "card_uuid" in columns else UPLOADS_SCHEMA_LEGACY
+
+
+def reset_uploads_state(settings: Settings) -> None:
+    """Drop Phase 2 upload state so Phase 3 starts clean.
+
+    Deletes only the contents of the uploads root and only the `uploads` table.
+    The `pings` table, the uploads root itself, and everything else on the
+    volume are left alone. Any failure propagates: aborting startup is safer
+    than serving a half-reset volume.
+    """
+    uploads_root = settings.uploads_root
+    if uploads_root.exists():
+        for entry in sorted(uploads_root.iterdir()):
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+
+    with closing(connect(settings.database_path)) as connection:
+        connection.execute("DROP TABLE IF EXISTS uploads")
+        connection.executescript(UPLOADS_SCHEMA)
+        connection.commit()
+
+    logger.warning(
+        "PHASE3_RESET_UPLOADS: dropped the Phase 2 uploads table and cleared %s; "
+        "ping history was preserved",
+        uploads_root,
+    )
+
+
 def initialize_database(database_path: Path) -> None:
     database_path.parent.mkdir(parents=True, exist_ok=True)
     with closing(connect(database_path)) as connection:
@@ -270,7 +370,24 @@ def initialize_database(database_path: Path) -> None:
 
 
 def initialize_storage(settings: Settings) -> None:
-    """Create the database and the blob directory on the volume."""
+    """Create the database and the blob directory on the volume.
+
+    A Phase 2 `uploads` table is handled before the Phase 3 schema is applied,
+    because `CREATE TABLE IF NOT EXISTS` would silently leave the old table —
+    and its `UNIQUE (device_id, filename)` constraint — in place.
+    """
+    settings.database_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if uploads_schema_state(settings.database_path) == UPLOADS_SCHEMA_LEGACY:
+        if not settings.reset_uploads:
+            raise RuntimeError(
+                "the uploads table is still on the Phase 2 schema (no card_uuid "
+                "column). Phase 3 cannot read it. Set PHASE3_RESET_UPLOADS=1 to "
+                "drop the uploads table and clear stored blobs; ping rows are "
+                "kept. This deletes every Phase 2 upload permanently."
+            )
+        reset_uploads_state(settings)
+
     initialize_database(settings.database_path)
     settings.uploads_root.mkdir(parents=True, exist_ok=True)
 
@@ -288,21 +405,22 @@ def insert_ping(
 
 
 def find_upload(
-    database_path: Path, device_id: str, filename: str
+    database_path: Path, device_id: str, card_uuid: str, filename: str
 ) -> Optional[sqlite3.Row]:
     """Return the stored row for a logical identity, or None."""
     with closing(connect(database_path)) as connection:
         connection.row_factory = sqlite3.Row
         return connection.execute(
-            "SELECT device_id, filename, stored_path, size, received_at "
-            "FROM uploads WHERE device_id = ? AND filename = ?",
-            (device_id, filename),
+            "SELECT device_id, card_uuid, filename, stored_path, size, received_at "
+            "FROM uploads WHERE device_id = ? AND card_uuid = ? AND filename = ?",
+            (device_id, card_uuid, filename),
         ).fetchone()
 
 
 def insert_upload(
     database_path: Path,
     device_id: str,
+    card_uuid: str,
     filename: str,
     stored_path: str,
     size: int,
@@ -311,20 +429,22 @@ def insert_upload(
     """Claim a logical identity. Raises sqlite3.IntegrityError if already taken."""
     with closing(connect(database_path)) as connection:
         cursor = connection.execute(
-            "INSERT INTO uploads (device_id, filename, stored_path, size, received_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (device_id, filename, stored_path, size, received_at),
+            "INSERT INTO uploads (device_id, card_uuid, filename, stored_path, size, "
+            "received_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (device_id, card_uuid, filename, stored_path, size, received_at),
         )
         connection.commit()
         return int(cursor.lastrowid)
 
 
-def delete_upload(database_path: Path, device_id: str, filename: str) -> None:
+def delete_upload(
+    database_path: Path, device_id: str, card_uuid: str, filename: str
+) -> None:
     """Release a claimed identity after the blob could not be published."""
     with closing(connect(database_path)) as connection:
         connection.execute(
-            "DELETE FROM uploads WHERE device_id = ? AND filename = ?",
-            (device_id, filename),
+            "DELETE FROM uploads WHERE device_id = ? AND card_uuid = ? AND filename = ?",
+            (device_id, card_uuid, filename),
         )
         connection.commit()
 
@@ -380,6 +500,7 @@ def _upload_response(status_value: str, row) -> UploadResponse:
     return UploadResponse(
         status=status_value,
         device_id=row["device_id"],
+        card_uuid=row["card_uuid"],
         filename=row["filename"],
         size=int(row["size"]),
         received_at=row["received_at"],
@@ -431,7 +552,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         )
         yield
 
-    app = FastAPI(title="Pi Ingest Server", version="2.0.0", lifespan=lifespan)
+    app = FastAPI(title="Pi Ingest Server", version="3.0.0", lifespan=lifespan)
     app.state.settings = resolved
 
     @app.get("/health", response_model=HealthResponse)
@@ -475,14 +596,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     async def upload(
         request: Request, settings: Settings = Depends(get_settings)
     ) -> UploadResponse:
-        """Store one CSV under the logical identity `(device_id, filename)`.
+        """Store one CSV under the identity `(device_id, card_uuid, filename)`.
 
         Delivery from the Pi is at least once, so this handler is idempotent:
-        the `UNIQUE (device_id, filename)` constraint decides which attempt
-        stores the blob, and every later attempt gets `already_stored` with the
-        existing metadata. The endpoint takes a raw `Request` rather than
-        `UploadFile` parameters so authentication and the size ceiling are both
-        applied before the multipart body is parsed.
+        the `UNIQUE (device_id, card_uuid, filename)` constraint decides which
+        attempt stores the blob, and every later attempt gets `already_stored`
+        with the existing metadata. The endpoint takes a raw `Request` rather
+        than `UploadFile` parameters so authentication and the size ceiling are
+        both applied before the multipart body is parsed.
         """
         limit = settings.max_upload_bytes
         declared = request.headers.get("content-length")
@@ -519,6 +640,17 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     ),
                 )
 
+            card_uuid = _form_text(form, "card_uuid")
+            try:
+                validate_card_uuid(card_uuid)
+            except ValueError as exc:
+                # The rejected value is not echoed back or logged verbatim.
+                logger.warning("Rejected an invalid card_uuid from %s", device_id)
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"invalid card_uuid: {exc}",
+                )
+
             filename = _form_text(form, "filename")
             try:
                 validate_filename(filename)
@@ -540,7 +672,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             # Cheap path for a retry whose acknowledgement was lost: answer from
             # the ledger without rewriting bytes that are already stored.
             try:
-                existing = find_upload(settings.database_path, device_id, filename)
+                existing = find_upload(
+                    settings.database_path, device_id, card_uuid, filename
+                )
             except sqlite3.Error:
                 logger.exception("Could not read the uploads table")
                 raise HTTPException(
@@ -549,22 +683,27 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 )
             if existing is not None:
                 logger.info(
-                    "Upload already stored: device_id=%s filename=%s size=%s",
+                    "Upload already stored: device_id=%s card_uuid=%s filename=%s size=%s",
                     device_id,
+                    card_uuid,
                     filename,
                     existing["size"],
                 )
                 return _upload_response("already_stored", existing)
 
-            device_directory = settings.uploads_root / device_id
-            final_path = device_directory / filename
+            # The card segment mirrors the Pi's queue layout, for the identical
+            # reason: without it, two cards' same-named files collide.
+            card_directory = settings.uploads_root / device_id / card_uuid
+            final_path = card_directory / filename
             try:
-                device_directory.mkdir(parents=True, exist_ok=True)
-                temp_path, size = await _write_temp_blob(source, device_directory, limit)
+                card_directory.mkdir(parents=True, exist_ok=True)
+                temp_path, size = await _write_temp_blob(source, card_directory, limit)
             except _FileTooLarge:
                 logger.warning(
-                    "Rejected oversized upload: device_id=%s filename=%s limit=%s",
+                    "Rejected oversized upload: device_id=%s card_uuid=%s "
+                    "filename=%s limit=%s",
                     device_id,
+                    card_uuid,
                     filename,
                     limit,
                 )
@@ -587,6 +726,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 insert_upload(
                     settings.database_path,
                     device_id,
+                    card_uuid,
                     filename,
                     str(final_path),
                     size,
@@ -594,7 +734,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 )
             except sqlite3.IntegrityError:
                 temp_path.unlink(missing_ok=True)
-                stored = find_upload(settings.database_path, device_id, filename)
+                stored = find_upload(
+                    settings.database_path, device_id, card_uuid, filename
+                )
                 if stored is None:  # pragma: no cover - defensive
                     raise HTTPException(
                         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -615,7 +757,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 # The row would otherwise point at a blob that does not exist.
                 logger.exception("Could not publish blob for device %s", device_id)
                 try:
-                    delete_upload(settings.database_path, device_id, filename)
+                    delete_upload(settings.database_path, device_id, card_uuid, filename)
                 finally:
                     temp_path.unlink(missing_ok=True)
                 raise HTTPException(
@@ -624,8 +766,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 )
 
             logger.info(
-                "Stored upload: device_id=%s filename=%s size=%s received_at=%s",
+                "Stored upload: device_id=%s card_uuid=%s filename=%s size=%s "
+                "received_at=%s",
                 device_id,
+                card_uuid,
                 filename,
                 size,
                 received_at,
@@ -633,6 +777,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             return UploadResponse(
                 status="stored",
                 device_id=device_id,
+                card_uuid=card_uuid,
                 filename=filename,
                 size=size,
                 received_at=received_at,

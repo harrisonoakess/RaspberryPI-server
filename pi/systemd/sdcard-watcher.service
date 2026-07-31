@@ -1,7 +1,11 @@
 [Unit]
-Description=Phase 2 SD card watcher (copies new CSV files into the upload queue)
+Description=Phase 3 SD card watcher (copies new CSV files into the upload queue)
 # No network dependency at all: ingestion is expected to work offline.
 After=local-fs.target
+# Ordering only. The watcher starts and keeps running whether or not a card is
+# mounted, so the mounter is not a hard dependency; starting after it just
+# avoids a pointless "nothing is mounted" tick at boot.
+After=sdcard-mounter.service
 
 # Keep a bad config from hot-looping; failures stay visible in the journal.
 StartLimitIntervalSec=300
@@ -19,8 +23,8 @@ TimeoutStopSec=20
 
 NoNewPrivileges=yes
 PrivateTmp=yes
-# The card is mounted read-only by root via the udev rule setup.sh installs, so
-# this service needs no mount privileges. ProtectSystem=strict leaves the unit's
+# The card is mounted read-only by root in sdcard-mounter.service, so this
+# service needs no mount privileges. ProtectSystem=strict leaves the unit's
 # namespace with slave mount propagation, so the card appearing on the host
 # propagates in and is visible read-only.
 ProtectSystem=strict

@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""Copies new CSV files off the configured SD card into the upload queue.
+"""Copies new CSV files off whatever SD card is currently mounted.
 
-The card is never cleared, so every insertion presents the full history of
-files the logger has ever written. This service copies only the ones the Pi
-does not already know about, and it never writes to the card.
+A card is never cleared, so every insertion presents the full history of files
+the logger has ever written. This service copies only the ones the Pi does not
+already know about *for that card*, and it never writes to the card.
 
-The card is mounted read-only by root (a udev rule installed by `setup.sh`
-runs `systemd-mount`), so this service needs no privileges: it only reads the
-mountpoint and writes to its own queue, ledger, and log.
+Phase 3 removes the single pinned card. The card identity is derived live, on
+every tick, from whatever filesystem is mounted at `CARD_MOUNTPOINT`: its
+filesystem UUID becomes the namespace for both the ledger and the queue
+directory, so two different cards carrying the same filename stay distinct.
+
+The card is mounted read-only by `sdcard_mounter.py`, which runs as root, so
+this service needs no privileges: it only reads the mountpoint and writes to its
+own queue, ledger, and log.
 
 Standard library only, except for the optional `pyudev` fast path — without it
 the service falls back to polling for the card on the same interval.
-See prd/phase-2-data-sync.md.
+See prd/phase-3-multi-card-ingestion.md.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import signal
+import stat
 import sys
 import tempfile
 import threading
@@ -30,19 +36,20 @@ from typing import Callable, Optional
 from state import Ledger, rfc3339_utc, summarize
 
 # `uploader` owns the client side of the HTTP contract, including the filename
-# rules the server enforces, so the watcher reuses them rather than keeping a
-# second copy inside pi/.
+# and card_uuid rules the server enforces, so the watcher reuses them rather
+# than keeping a second copy inside pi/.
 from uploader import (
     ConfigError,
     StateLogger,
     build_logger,
+    is_safe_card_uuid,
     is_safe_filename,
     positive_float,
 )
 
 LOGGER_NAME = "piuploader.watcher"
 
-DEFAULT_MAX_UPLOAD_BYTES = 10_485_760  # 10 MiB, matched on the server.
+DEFAULT_MAX_UPLOAD_BYTES = 20_971_520  # 20 MiB, matched on the server.
 DEFAULT_QUEUE_PATH = Path("/var/lib/piuploader/queue")
 DEFAULT_STATE_DB_PATH = Path("/var/lib/piuploader/state.db")
 DEFAULT_LOG_PATH = Path("/var/log/piuploader/sdcard-watcher.log")
@@ -52,12 +59,15 @@ COPY_CHUNK_BYTES = 262_144
 
 CATEGORY_CARD_ABSENT = "card_absent"
 CATEGORY_CARD_NOT_MOUNTED = "card_not_mounted"
-CATEGORY_WRONG_CARD = "wrong_card"
 CATEGORY_SCAN_FAILED = "scan_failed"
 
 
 class CardError(Exception):
-    """The configured card could not be read."""
+    """The mounted card could not be read."""
+
+
+class CardChanged(Exception):
+    """The mounted card changed while a file was being copied."""
 
 
 class FileTooLarge(Exception):
@@ -65,10 +75,21 @@ class FileTooLarge(Exception):
 
 
 @dataclass(frozen=True)
+class CardIdentity:
+    """The card currently mounted: its filesystem UUID and device number.
+
+    Both halves are compared before a copy is published. The UUID alone would
+    not notice a swap to a cloned filesystem, and the device number alone is
+    reused by the kernel across insertions.
+    """
+
+    uuid: str
+    device_number: int
+
+
+@dataclass(frozen=True)
 class WatcherConfig:
-    card_uuid: str
     card_mountpoint: Path
-    card_filesystem: str = ""
     queue_path: Path = DEFAULT_QUEUE_PATH
     state_db_path: Path = DEFAULT_STATE_DB_PATH
     max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES
@@ -83,24 +104,27 @@ class WatcherConfig:
     def pending_dir(self) -> Path:
         return self.queue_path / "pending"
 
+    def pending_dir_for(self, card_uuid: str) -> Path:
+        """Per-card queue directory. `card_uuid` is validated before this call.
+
+        Without the card segment, two cards' same-named files would overwrite
+        each other in the queue even though the ledger treats them as distinct.
+        """
+        return self.pending_dir / card_uuid
+
     @property
     def temp_dir(self) -> Path:
         """Staging area for in-progress copies.
 
         It sits on the same filesystem as `pending_dir` so publishing a
-        finished copy is an atomic rename, never a second copy.
+        finished copy is an atomic rename, never a second copy. It stays flat:
+        `tempfile.mkstemp` already generates names independent of the source.
         """
         return self.queue_path / "tmp"
 
     @staticmethod
     def from_env(env: Optional[dict] = None) -> "WatcherConfig":
         env = os.environ if env is None else env
-
-        card_uuid = env.get("CARD_UUID", "").strip()
-        if not card_uuid:
-            raise ConfigError(
-                "CARD_UUID is required; re-run setup.sh with the card inserted to detect it"
-            )
 
         mountpoint = env.get("CARD_MOUNTPOINT", "").strip()
         if not mountpoint:
@@ -111,9 +135,7 @@ class WatcherConfig:
         )
 
         return WatcherConfig(
-            card_uuid=card_uuid,
             card_mountpoint=Path(mountpoint),
-            card_filesystem=env.get("CARD_FILESYSTEM", "").strip(),
             queue_path=Path(env.get("QUEUE_PATH", "").strip() or DEFAULT_QUEUE_PATH),
             state_db_path=Path(
                 env.get("STATE_DB_PATH", "").strip() or DEFAULT_STATE_DB_PATH
@@ -127,34 +149,51 @@ class WatcherConfig:
         )
 
 
-def card_device(config: WatcherConfig) -> Optional[Path]:
-    """The block device for `CARD_UUID`, or None when the card is not inserted.
+def is_mount_boundary(mountpoint: Path) -> bool:
+    """Whether `mountpoint` really holds a filesystem of its own.
 
-    `/dev/disk/by-uuid` is maintained by udev and readable without privileges,
-    so presence can be checked without running `blkid` as root.
+    Without this guard, "nothing is mounted" would fall through to matching the
+    root filesystem's own UUID and the watcher would scan the Pi's boot disk.
     """
-    link = config.by_uuid_root / config.card_uuid
     try:
-        if not link.exists():
-            return None
-        return link.resolve()
+        mount_stat = os.stat(mountpoint)
+        parent_stat = os.stat(Path(mountpoint).parent)
+    except OSError:
+        return False
+    return mount_stat.st_dev != parent_stat.st_dev
+
+
+def discover_card(config: WatcherConfig) -> Optional[CardIdentity]:
+    """The `(uuid, device_number)` mounted at `CARD_MOUNTPOINT`, or None.
+
+    Generalizes Phase 2's single-UUID check: instead of asking whether one
+    configured UUID is mounted here, it asks which UUID is. `/dev/disk/by-uuid`
+    is maintained by udev and readable without privileges, so this needs no
+    root and no `blkid` call.
+    """
+    if not is_mount_boundary(config.card_mountpoint):
+        return None
+
+    try:
+        device_number = os.stat(config.card_mountpoint).st_dev
+        names = os.listdir(config.by_uuid_root)
     except OSError:
         return None
 
-
-def card_is_mounted(config: WatcherConfig, device: Path) -> bool:
-    """Whether `CARD_MOUNTPOINT` currently holds the filesystem on `device`.
-
-    Compares the mountpoint's device number with the block device's, which
-    proves the configured card — and not some other removable drive that
-    happened to be mounted there — is what will be scanned.
-    """
-    try:
-        mount_stat = os.stat(config.card_mountpoint)
-        device_stat = os.stat(device)
-    except OSError:
-        return False
-    return mount_stat.st_dev == device_stat.st_rdev
+    for name in sorted(names):
+        # An unsafe UUID is not usable as a queue path segment or in the upload
+        # payload, so such a card is treated as absent rather than sanitized.
+        if not is_safe_card_uuid(name):
+            continue
+        try:
+            device_stat = os.stat(config.by_uuid_root / name)
+        except OSError:
+            continue
+        if not stat.S_ISBLK(device_stat.st_mode):
+            continue
+        if device_stat.st_rdev == device_number:
+            return CardIdentity(uuid=name, device_number=device_number)
+    return None
 
 
 def in_scope_files(mountpoint: Path) -> list:
@@ -183,12 +222,14 @@ def in_scope_files(mountpoint: Path) -> list:
     return sorted(candidates)
 
 
-def copy_into_queue(source: Path, config: WatcherConfig) -> int:
-    """Copy one card file into `queue/pending/`. Returns the byte count.
+def copy_into_queue(source: Path, config: WatcherConfig, card: CardIdentity) -> int:
+    """Copy one card file into `queue/pending/<card_uuid>/`. Returns the bytes.
 
-    The copy is written to `queue/tmp/` and only renamed into `pending/` once
-    it is complete and fsynced, so an interrupted copy is never published. The
-    card file is opened read-only and left untouched.
+    The copy is written to `queue/tmp/` and only renamed into the per-card
+    queue directory once it is complete, fsynced, and the mounted card has been
+    confirmed to still be the one the bytes came from. An interrupted copy, or
+    one that spanned a card swap, is never published. The card file is opened
+    read-only and left untouched.
     """
     handle, temp_name = tempfile.mkstemp(dir=config.temp_dir, prefix=".copy-", suffix=".part")
     temp_path = Path(temp_name)
@@ -207,7 +248,19 @@ def copy_into_queue(source: Path, config: WatcherConfig) -> int:
                 destination.write(chunk)
             destination.flush()
             os.fsync(destination.fileno())
-        os.replace(temp_path, config.pending_dir / source.name)
+
+        # Re-resolved immediately before publishing: these bytes are only this
+        # card's file if this card is still the one mounted.
+        if discover_card(config) != card:
+            raise CardChanged(
+                f"card {card.uuid} was replaced while copying {source.name!r}"
+            )
+
+        # Created here, not earlier, so the window in which the uploader could
+        # remove the emptied directory between mkdir and rename is negligible.
+        destination_dir = config.pending_dir_for(card.uuid)
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        os.replace(temp_path, destination_dir / source.name)
     except BaseException:
         temp_path.unlink(missing_ok=True)
         raise
@@ -221,12 +274,13 @@ class IngestResult:
     skipped_known: int = 0
     rejected: int = 0
     failed: int = 0
+    aborted: bool = False
 
     def __str__(self) -> str:
         return (
             f"copied={self.copied} bytes={self.bytes_copied} "
             f"skipped_known={self.skipped_known} rejected={self.rejected} "
-            f"failed={self.failed}"
+            f"failed={self.failed} aborted={self.aborted}"
         )
 
 
@@ -234,17 +288,25 @@ def ingest_card(
     config: WatcherConfig,
     ledger: Ledger,
     logger: logging.Logger,
+    card: CardIdentity,
     now: Callable[[], str] = rfc3339_utc,
 ) -> IngestResult:
-    """Copy every new in-scope file from the card into the queue.
+    """Copy every new in-scope file from the mounted card into its queue.
 
     A rejected or failed file is logged and skipped; later files are still
-    processed. Nothing on the card is modified or deleted.
+    processed. If the card changes mid-scan the pass stops without writing a
+    ledger row for the file in flight, and the next tick starts over. Nothing
+    on the card is modified or deleted.
     """
     result = IngestResult()
     names = in_scope_files(config.card_mountpoint)
-    known = ledger.known_filenames()
-    logger.info("scanning %s: %d in-scope csv file(s)", config.card_mountpoint, len(names))
+    known = ledger.known_filenames(card.uuid)
+    logger.info(
+        "scanning %s (card %s): %d in-scope csv file(s)",
+        config.card_mountpoint,
+        card.uuid,
+        len(names),
+    )
 
     for name in names:
         if not is_safe_filename(name):
@@ -256,6 +318,13 @@ def ingest_card(
         if name in known:
             result.skipped_known += 1
             continue
+
+        # Checked before each copy as well as after, so a swap is noticed even
+        # if it happens between two files.
+        if discover_card(config) != card:
+            logger.warning("card %s is no longer mounted; stopping this scan", card.uuid)
+            result.aborted = True
+            break
 
         source = config.card_mountpoint / name
         try:
@@ -275,11 +344,17 @@ def ingest_card(
             continue
 
         try:
-            copied = copy_into_queue(source, config)
+            copied = copy_into_queue(source, config, card)
         except FileTooLarge as exc:
             logger.error("rejecting %r: %s", name, exc)
             result.rejected += 1
             continue
+        except CardChanged as exc:
+            # The temporary copy is already gone and no row was written, so the
+            # file is simply retried whenever that card is next mounted.
+            logger.warning("%s; nothing was queued for it", exc)
+            result.aborted = True
+            break
         except OSError as exc:
             # Hot-unplug mid-copy lands here: no partial file is published and
             # the ledger stays clean, so the next insertion retries.
@@ -290,15 +365,16 @@ def ingest_card(
         # Recorded after the rename so the ledger never claims a file the queue
         # does not have. A crash in between leaves a queued file with no row;
         # the uploader still delivers it and marks it uploaded.
-        ledger.record_pending(name, now())
+        ledger.record_pending(card.uuid, name, now())
         result.copied += 1
         result.bytes_copied += copied
-        logger.info("queued %r (%d bytes)", name, copied)
+        logger.info("queued %s/%r (%d bytes)", card.uuid, name, copied)
 
     return result
 
 
 def prepare_directories(config: WatcherConfig) -> None:
+    """Create the queue skeleton. Per-card directories are created on demand."""
     for directory in (config.pending_dir, config.temp_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -328,9 +404,9 @@ def clear_stale_temp_files(config: WatcherConfig, logger: logging.Logger) -> int
 def open_udev_monitor(logger: logging.Logger):
     """A started pyudev block-device monitor, or None if pyudev is unavailable.
 
-    The monitor only shortens the latency between inserting the card and
-    scanning it. Presence is always confirmed by looking at the filesystem, so
-    losing this fast path costs latency, not correctness.
+    The monitor only shortens the latency between inserting a card and scanning
+    it. Presence is always confirmed by looking at the filesystem, so losing
+    this fast path costs latency, not correctness.
     """
     try:
         import pyudev
@@ -383,53 +459,50 @@ def check_once(
     ledger: Ledger,
     logger: logging.Logger,
     state_logger: StateLogger,
-    card_was_present: bool,
 ) -> bool:
-    """Ingest on a transition to "card present". Returns the new presence state.
+    """Scan whatever card is mounted. Returns whether one was ingested.
+
+    Every tick scans, rather than only the tick after an insertion: ledger
+    dedup makes a repeat scan free at this volume, and it removes the need to
+    track insertion transitions, which is what made Phase 2 depend on a single
+    known card.
 
     Never raises: a failure here must not take the service down, because the
     next insertion has to be picked up.
     """
-    device = card_device(config)
-    if device is None:
-        state_logger.record(
-            CATEGORY_CARD_ABSENT,
-            f"card {config.card_uuid} is not inserted",
-            level=logging.INFO,
-        )
+    card = discover_card(config)
+    if card is None:
+        if is_mount_boundary(config.card_mountpoint):
+            state_logger.record(
+                CATEGORY_CARD_NOT_MOUNTED,
+                f"{config.card_mountpoint} is mounted but no safe card UUID "
+                "resolves to it; not scanning",
+                level=logging.WARNING,
+            )
+        else:
+            state_logger.record(
+                CATEGORY_CARD_ABSENT,
+                f"no card is mounted at {config.card_mountpoint}",
+                level=logging.INFO,
+            )
         return False
-
-    if not card_is_mounted(config, device):
-        # setup.sh's udev rule mounts the card a moment after the device
-        # appears, so this is normal for the first tick after insertion.
-        state_logger.record(
-            CATEGORY_CARD_NOT_MOUNTED,
-            f"card {config.card_uuid} ({device}) is not mounted at "
-            f"{config.card_mountpoint} yet",
-            level=logging.WARNING,
-        )
-        return False
-
-    if card_was_present:
-        return True
 
     try:
-        result = ingest_card(config, ledger, logger)
+        result = ingest_card(config, ledger, logger, card)
     except CardError as exc:
         state_logger.record(CATEGORY_SCAN_FAILED, str(exc), level=logging.ERROR)
         return False
     except Exception as exc:
-        # Returns True so a persistent, unexplained failure does not re-scan on
-        # every tick; removing and reinserting the card retries it.
         state_logger.record(
             CATEGORY_SCAN_FAILED,
-            f"unexpected error ingesting the card: {exc!r}",
+            f"unexpected error ingesting card {card.uuid}: {exc!r}",
             level=logging.ERROR,
         )
-        return True
+        return False
 
-    logger.info("card ingest complete: %s", result)
-    logger.info("ledger now holds %s", summarize(ledger.counts()))
+    if result.copied or result.rejected or result.failed or result.aborted:
+        logger.info("card %s ingest complete: %s", card.uuid, result)
+        logger.info("ledger now holds %s", summarize(ledger.counts()))
     return True
 
 
@@ -442,12 +515,11 @@ def run(
     monitor=None,
     max_iterations: Optional[int] = None,
 ) -> int:
-    """Watch for the card until stopped. One sequential loop, no overlap."""
+    """Watch for a card until stopped. One sequential loop, no overlap."""
     iterations = 0
-    card_present = False
 
     while not stop_event.is_set():
-        card_present = check_once(config, ledger, logger, state_logger, card_present)
+        check_once(config, ledger, logger, state_logger)
         iterations += 1
 
         if max_iterations is not None and iterations >= max_iterations:
@@ -468,10 +540,7 @@ def main(argv: Optional[list] = None) -> int:
         LOGGER_NAME, config.log_path, config.log_max_bytes, config.log_backup_count
     )
     logger.info(
-        "sdcard watcher starting: uuid=%s filesystem=%s mountpoint=%s queue=%s "
-        "ledger=%s max_bytes=%s scan=%ss",
-        config.card_uuid,
-        config.card_filesystem or "unrecorded",
+        "sdcard watcher starting: mountpoint=%s queue=%s ledger=%s max_bytes=%s scan=%ss",
         config.card_mountpoint,
         config.queue_path,
         config.state_db_path,

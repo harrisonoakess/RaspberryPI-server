@@ -1,0 +1,35 @@
+[Unit]
+Description=Phase 3 SD card mounter (mounts any qualifying card read-only)
+# No network dependency at all: ingestion is expected to work offline.
+After=local-fs.target
+
+# Keep a bad config from hot-looping; failures stay visible in the journal.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# Root, because mounting requires privileges. This is the only privileged unit:
+# sdcard-watcher and uploader stay unprivileged and only read the mountpoint.
+User=root
+Group=root
+EnvironmentFile=/etc/piuploader/config.env
+ExecStart=/usr/bin/python3 -u /opt/piuploader/sdcard_mounter.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+
+# The mount this unit makes has to be visible to the rest of the system, so it
+# deliberately runs in the host mount namespace. PrivateTmp, ProtectSystem,
+# ProtectHome, ProtectKernelTunables, and ReadWritePaths each create a private
+# mount namespace, which would hide the card from sdcard-watcher — do not add
+# them here.
+PrivateMounts=no
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

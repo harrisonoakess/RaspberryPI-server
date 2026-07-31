@@ -2,8 +2,9 @@
 
 Phase 1 criteria that carry over: disconnected behavior, connected soak,
 disconnect/reconnect, and failure log rate limiting.
-Phase 2 criteria: 4 (online transfer, including the acknowledgement rules that
-gate deleting a local copy) and 6 (at-least-once retries).
+Phase 3 criteria: 7 (nested per-card queue), 10 (acknowledgement safety,
+including the card_uuid check that gates deleting a local copy), and 12 (the
+Phase 2 delivery failures, now per card).
 """
 
 import json
@@ -32,12 +33,14 @@ from uploader import (
     StateLogger,
     UploadError,
     build_multipart,
+    is_safe_card_uuid,
     is_safe_filename,
     is_wifi_connected,
     poll_once,
-    queued_filenames,
+    queued_entries,
     resolve_device_id,
     run,
+    scan_pending,
     send_ping,
     send_upload,
     upload_pending,
@@ -46,6 +49,9 @@ from uploader import (
 # A queue path that does not exist: the ping-focused tests must not depend on
 # any real queue directory being present on the machine running them.
 NO_QUEUE = Path("/nonexistent-piuploader-queue")
+
+CARD_A = "1234-ABCD"
+CARD_B = "5678-EF01"
 
 BASE_CONFIG = Config(
     server_url="https://example.up.railway.app",
@@ -148,6 +154,7 @@ def upload_ack(
     filename,
     size,
     device_id="pi",
+    card_uuid=CARD_A,
     status="stored",
     received_at="2026-07-29T18:30:01Z",
     code=200,
@@ -158,6 +165,7 @@ def upload_ack(
             {
                 "status": status,
                 "device_id": device_id,
+                "card_uuid": card_uuid,
                 "filename": filename,
                 "size": size,
                 "received_at": received_at,
@@ -221,9 +229,12 @@ def ledger(queue_config):
     return instance
 
 
-def enqueue(config, ledger, name, content=b"a,b\n1,2\n"):
-    (config.pending_dir / name).write_bytes(content)
-    ledger.record_pending(name)
+def enqueue(config, ledger, name, content=b"a,b\n1,2\n", card_uuid=CARD_A):
+    """Queue one file exactly the way the watcher does: pending/<card>/<name>."""
+    directory = config.pending_dir_for(card_uuid)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / name).write_bytes(content)
+    ledger.record_pending(card_uuid, name)
     return content
 
 
@@ -239,7 +250,7 @@ def test_config_from_env_applies_documented_defaults():
     assert config.request_timeout_seconds == 10.0
     assert config.upload_timeout_seconds == 120.0
     assert config.error_log_repeat_seconds == 300.0
-    assert config.max_upload_bytes == 10_485_760
+    assert config.max_upload_bytes == 20_971_520
     assert config.queue_path == Path("/var/lib/piuploader/queue")
     assert config.state_db_path == Path("/var/lib/piuploader/state.db")
     assert config.ping_url == "https://x.up.railway.app/ping"
@@ -473,12 +484,13 @@ def test_ping_error_messages_never_contain_the_api_key():
 # --- Criterion 4: the POST /upload request ------------------------------------
 
 
-def test_multipart_body_carries_the_three_documented_fields():
-    body, content_type = build_multipart("pi", "logger-0001.csv", b"a,b\n1,2\n")
+def test_multipart_body_carries_the_four_documented_fields():
+    body, content_type = build_multipart("pi", CARD_A, "logger-0001.csv", b"a,b\n1,2\n")
 
     assert content_type.startswith("multipart/form-data; boundary=")
     assert parse_multipart(body, content_type) == {
         "device_id": b"pi",
+        "card_uuid": CARD_A.encode(),
         "filename": b"logger-0001.csv",
         "file": b"a,b\n1,2\n",
     }
@@ -496,7 +508,7 @@ def test_multipart_boundary_is_redrawn_when_it_occurs_in_the_content(monkeypatch
 
     monkeypatch.setattr(uploader.secrets, "token_hex", scripted_token_hex)
     collision = b"x----piuploader" + b"00" * 16 + b"y"
-    body, content_type = build_multipart("pi", "a.csv", collision)
+    body, content_type = build_multipart("pi", CARD_A, "a.csv", collision)
 
     assert len(drawn) == 2  # the first boundary collided, so a second was drawn
     assert parse_multipart(body, content_type)["file"] == collision
@@ -505,7 +517,7 @@ def test_multipart_boundary_is_redrawn_when_it_occurs_in_the_content(monkeypatch
 def test_multipart_file_part_uses_a_fixed_informational_filename():
     """The authoritative name is the `filename` field, so no real name is ever
     interpolated into a header where it could forge one."""
-    body, _ = build_multipart("pi", 'quote".csv', b"payload")
+    body, _ = build_multipart("pi", CARD_A, 'quote".csv', b"payload")
     headers = body.split(b"\r\n\r\n")[0]
 
     assert b'filename="upload.csv"' in body
@@ -514,7 +526,7 @@ def test_multipart_file_part_uses_a_fixed_informational_filename():
 
 def test_upload_sends_the_documented_request():
     opener = FakeOpener([upload_ack("logger-0001.csv", 8)])
-    send_upload(BASE_CONFIG, "pi", "logger-0001.csv", b"a,b\n1,2\n", opener=opener)
+    send_upload(BASE_CONFIG, "pi", CARD_A, "logger-0001.csv", b"a,b\n1,2\n", opener=opener)
 
     request, timeout = opener.requests[0]
     assert request.full_url == UPLOAD_URL
@@ -528,18 +540,18 @@ def test_upload_sends_the_documented_request():
 
 def test_upload_accepts_an_empty_file():
     opener = FakeOpener([upload_ack("empty.csv", 0)])
-    assert send_upload(BASE_CONFIG, "pi", "empty.csv", b"", opener=opener)["status"] == "stored"
+    assert send_upload(BASE_CONFIG, "pi", CARD_A, "empty.csv", b"", opener=opener)["status"] == "stored"
 
 
 def test_upload_accepts_a_file_exactly_at_the_limit():
     content = b"x" * BASE_CONFIG.max_upload_bytes
     opener = FakeOpener([upload_ack("big.csv", len(content))])
-    assert send_upload(BASE_CONFIG, "pi", "big.csv", content, opener=opener)["status"] == "stored"
+    assert send_upload(BASE_CONFIG, "pi", CARD_A, "big.csv", content, opener=opener)["status"] == "stored"
 
 
 def test_upload_accepts_already_stored_as_success():
     opener = FakeOpener([upload_ack("a.csv", 3, status="already_stored")])
-    acknowledgement = send_upload(BASE_CONFIG, "pi", "a.csv", b"a,b", opener=opener)
+    acknowledgement = send_upload(BASE_CONFIG, "pi", CARD_A, "a.csv", b"a,b", opener=opener)
     assert acknowledgement["status"] == "already_stored"
 
 
@@ -566,31 +578,47 @@ def test_upload_accepts_already_stored_as_success():
 def test_upload_failures_map_to_stable_categories(outcome, category):
     opener = FakeOpener([outcome])
     with pytest.raises(UploadError) as excinfo:
-        send_upload(BASE_CONFIG, "pi", "a.csv", b"a,b", opener=opener)
+        send_upload(BASE_CONFIG, "pi", CARD_A, "a.csv", b"a,b", opener=opener)
     assert excinfo.value.category == category
+
+
+def ack_payload(**overrides):
+    payload = {
+        "status": "stored",
+        "device_id": "pi",
+        "card_uuid": CARD_A,
+        "filename": "a.csv",
+        "size": 3,
+    }
+    payload.update(overrides)
+    return {key: value for key, value in payload.items() if value is not None}
 
 
 @pytest.mark.parametrize(
     "payload,category",
     [
-        ({"status": "queued", "device_id": "pi", "filename": "a.csv", "size": 3}, "invalid_ack"),
-        ({"status": "stored", "device_id": "other", "filename": "a.csv", "size": 3}, "mismatched_ack"),
-        ({"status": "stored", "device_id": "pi", "filename": "b.csv", "size": 3}, "mismatched_ack"),
-        ({"status": "stored", "device_id": "pi", "filename": "a.csv", "size": 4}, "mismatched_ack"),
-        ({"status": "stored", "device_id": "pi", "filename": "a.csv"}, "mismatched_ack"),
+        (ack_payload(status="queued"), "invalid_ack"),
+        (ack_payload(device_id="other"), "mismatched_ack"),
+        (ack_payload(filename="b.csv"), "mismatched_ack"),
+        (ack_payload(size=4), "mismatched_ack"),
+        (ack_payload(size=None), "mismatched_ack"),
+        # Criterion 10: the acknowledgement has to name the card that was sent.
+        (ack_payload(card_uuid=None), "mismatched_ack"),
+        (ack_payload(card_uuid=CARD_B), "mismatched_ack"),
+        (ack_payload(card_uuid=CARD_A.lower()), "mismatched_ack"),
     ],
 )
 def test_upload_rejects_an_acknowledgement_that_does_not_match_the_request(payload, category):
     opener = FakeOpener([FakeResponse(200, json.dumps(payload).encode())])
     with pytest.raises(UploadError) as excinfo:
-        send_upload(BASE_CONFIG, "pi", "a.csv", b"a,b", opener=opener)
+        send_upload(BASE_CONFIG, "pi", CARD_A, "a.csv", b"a,b", opener=opener)
     assert excinfo.value.category == category
 
 
 def test_upload_refuses_an_unsafe_filename_without_sending_anything():
     opener = FakeOpener()
     with pytest.raises(UploadError) as excinfo:
-        send_upload(BASE_CONFIG, "pi", "../escape.csv", b"a", opener=opener)
+        send_upload(BASE_CONFIG, "pi", CARD_A, "../escape.csv", b"a", opener=opener)
 
     assert excinfo.value.category == "unsafe_filename"
     assert opener.requests == []
@@ -600,7 +628,7 @@ def test_upload_refuses_an_oversized_file_without_sending_anything():
     opener = FakeOpener()
     content = b"x" * (BASE_CONFIG.max_upload_bytes + 1)
     with pytest.raises(UploadError) as excinfo:
-        send_upload(BASE_CONFIG, "pi", "big.csv", content, opener=opener)
+        send_upload(BASE_CONFIG, "pi", CARD_A, "big.csv", content, opener=opener)
 
     assert excinfo.value.category == "too_large"
     assert opener.requests == []
@@ -609,7 +637,12 @@ def test_upload_refuses_an_oversized_file_without_sending_anything():
 def test_upload_error_messages_never_contain_the_api_key():
     with pytest.raises(UploadError) as excinfo:
         send_upload(
-            BASE_CONFIG, "pi", "a.csv", b"a", opener=FakeOpener([http_error(401, UPLOAD_URL)])
+            BASE_CONFIG,
+            "pi",
+            CARD_A,
+            "a.csv",
+            b"a",
+            opener=FakeOpener([http_error(401, UPLOAD_URL)]),
         )
     assert BASE_CONFIG.api_key not in str(excinfo.value)
 
@@ -618,7 +651,7 @@ def test_upload_error_messages_never_contain_the_api_key():
 
 
 def test_queued_filenames_is_empty_when_the_queue_does_not_exist():
-    assert queued_filenames(BASE_CONFIG) == []
+    assert queued_entries(BASE_CONFIG) == []
 
 
 def test_successful_upload_marks_the_ledger_and_clears_the_queued_copy(
@@ -631,8 +664,8 @@ def test_successful_upload_marks_the_ledger_and_clears_the_queued_copy(
     batch = upload_pending(queue_config, "pi", ledger, state, opener=opener)
 
     assert (batch.attempted, batch.uploaded, batch.failed) == (1, 1, 0)
-    assert ledger.status_of("logger-0001.csv") == STATUS_UPLOADED
-    assert not (queue_config.pending_dir / "logger-0001.csv").exists()
+    assert ledger.status_of(CARD_A, "logger-0001.csv") == STATUS_UPLOADED
+    assert not (queue_config.pending_dir_for(CARD_A) / "logger-0001.csv").exists()
 
 
 def test_already_stored_also_clears_the_queued_copy(queue_config, ledger, caplog_logger):
@@ -644,8 +677,8 @@ def test_already_stored_also_clears_the_queued_copy(queue_config, ledger, caplog
     batch = upload_pending(queue_config, "pi", ledger, state, opener=opener)
 
     assert (batch.uploaded, batch.already_stored) == (0, 1)
-    assert ledger.status_of("a.csv") == STATUS_UPLOADED
-    assert not (queue_config.pending_dir / "a.csv").exists()
+    assert ledger.status_of(CARD_A, "a.csv") == STATUS_UPLOADED
+    assert not (queue_config.pending_dir_for(CARD_A) / "a.csv").exists()
 
 
 def test_files_are_sent_with_their_exact_bytes_and_names(queue_config, ledger, caplog_logger):
@@ -659,6 +692,7 @@ def test_files_are_sent_with_their_exact_bytes_and_names(queue_config, ledger, c
     fields = parse_multipart(request.data, request.get_header("Content-type"))
     assert fields == {
         "device_id": b"pi",
+        "card_uuid": CARD_A.encode(),
         "filename": b"logger-0002.csv",
         "file": b"sensor,value\r\n1,2\r\n",
     }
@@ -672,7 +706,7 @@ def test_an_empty_queued_file_is_uploaded(queue_config, ledger, caplog_logger):
     batch = upload_pending(queue_config, "pi", ledger, state, opener=opener)
 
     assert batch.uploaded == 1
-    assert ledger.status_of("empty.csv") == STATUS_UPLOADED
+    assert ledger.status_of(CARD_A, "empty.csv") == STATUS_UPLOADED
 
 
 @pytest.mark.parametrize(
@@ -708,8 +742,8 @@ def test_a_failed_upload_leaves_the_file_pending_for_retry(
     batch = upload_pending(queue_config, "pi", ledger, state, opener=FakeOpener([outcome]))
 
     assert batch.uploaded == 0
-    assert ledger.status_of("a.csv") == STATUS_PENDING
-    assert (queue_config.pending_dir / "a.csv").exists()
+    assert ledger.status_of(CARD_A, "a.csv") == STATUS_PENDING
+    assert (queue_config.pending_dir_for(CARD_A) / "a.csv").exists()
 
 
 def test_one_failure_does_not_stop_the_files_after_it(queue_config, ledger, caplog_logger):
@@ -724,10 +758,10 @@ def test_one_failure_does_not_stop_the_files_after_it(queue_config, ledger, capl
     batch = upload_pending(queue_config, "pi", ledger, state, opener=opener)
 
     assert (batch.attempted, batch.uploaded, batch.failed) == (3, 2, 1)
-    assert ledger.status_of("a.csv") == STATUS_UPLOADED
-    assert ledger.status_of("b.csv") == STATUS_PENDING
-    assert ledger.status_of("c.csv") == STATUS_UPLOADED
-    assert (queue_config.pending_dir / "b.csv").exists()
+    assert ledger.status_of(CARD_A, "a.csv") == STATUS_UPLOADED
+    assert ledger.status_of(CARD_A, "b.csv") == STATUS_PENDING
+    assert ledger.status_of(CARD_A, "c.csv") == STATUS_UPLOADED
+    assert (queue_config.pending_dir_for(CARD_A) / "b.csv").exists()
 
 
 def test_a_retry_on_a_later_tick_delivers_the_file_that_failed(
@@ -739,16 +773,17 @@ def test_a_retry_on_a_later_tick_delivers_the_file_that_failed(
     upload_pending(
         queue_config, "pi", ledger, state, opener=FakeOpener([http_error(503, UPLOAD_URL)])
     )
-    assert ledger.status_of("a.csv") == STATUS_PENDING
+    assert ledger.status_of(CARD_A, "a.csv") == STATUS_PENDING
 
     upload_pending(queue_config, "pi", ledger, state, opener=FakeOpener([upload_ack("a.csv", 5)]))
 
-    assert ledger.status_of("a.csv") == STATUS_UPLOADED
-    assert queued_filenames(queue_config) == []
+    assert ledger.status_of(CARD_A, "a.csv") == STATUS_UPLOADED
+    assert queued_entries(queue_config) == []
 
 
 def test_an_unsafe_queued_name_is_skipped_and_never_sent(queue_config, ledger, caplog_logger):
-    (queue_config.pending_dir / "notes.txt").write_bytes(b"x")
+    queue_config.pending_dir_for(CARD_A).mkdir(parents=True)
+    (queue_config.pending_dir_for(CARD_A) / "notes.txt").write_bytes(b"x")
     opener = FakeOpener()
     state = StateLogger(caplog_logger, 300.0, clock=FakeClock())
 
@@ -757,7 +792,7 @@ def test_an_unsafe_queued_name_is_skipped_and_never_sent(queue_config, ledger, c
     assert (batch.attempted, batch.rejected) == (0, 1)
     assert opener.requests == []
     # Left in place: deleting data is worse than a repeated log line.
-    assert (queue_config.pending_dir / "notes.txt").exists()
+    assert (queue_config.pending_dir_for(CARD_A) / "notes.txt").exists()
 
 
 def test_an_empty_queue_makes_no_requests(queue_config, ledger, caplog_logger):
@@ -872,7 +907,10 @@ def test_upload_and_ping_failures_use_separate_categories(
     )
 
     assert any("ping failed [server_error]" in r.message for r in caplog.records)
-    assert any("upload of 'a.csv' failed [server_error]" in r.message for r in caplog.records)
+    assert any(
+        f"upload of '{CARD_A}/a.csv' failed [server_error]" in r.message
+        for r in caplog.records
+    )
 
 
 # --- Heartbeat cadence --------------------------------------------------------
@@ -973,8 +1011,8 @@ def test_disconnected_poll_makes_no_request_of_either_kind(queue_config, ledger,
 
     assert opener.requests == []
     # Criterion 3: queued while offline, still queued, still pending.
-    assert ledger.status_of("a.csv") == STATUS_PENDING
-    assert (queue_config.pending_dir / "a.csv").exists()
+    assert ledger.status_of(CARD_A, "a.csv") == STATUS_PENDING
+    assert (queue_config.pending_dir_for(CARD_A) / "a.csv").exists()
 
 
 def test_three_minutes_disconnected_logs_once_and_sends_nothing(caplog_logger, caplog):
@@ -1045,8 +1083,8 @@ def test_unexpected_upload_exception_does_not_crash_the_loop(
         wifi_check=lambda _: True,
     )
 
-    assert ledger.status_of("a.csv") == STATUS_PENDING
-    assert (queue_config.pending_dir / "a.csv").exists()
+    assert ledger.status_of(CARD_A, "a.csv") == STATUS_PENDING
+    assert (queue_config.pending_dir_for(CARD_A) / "a.csv").exists()
 
 
 # --- Criterion 4: reconnect drains the queue within one poll interval ---------
@@ -1076,8 +1114,8 @@ def test_reconnecting_uploads_the_queue_on_the_next_poll(queue_config, ledger, c
     assert iterations == 2
     # Nothing was sent on the offline tick; both files went out on the next one.
     assert len(opener.upload_requests) == 2
-    assert queued_filenames(queue_config) == []
-    assert ledger.filenames_with_status(STATUS_UPLOADED) == ["a.csv", "b.csv"]
+    assert queued_entries(queue_config) == []
+    assert ledger.filenames_with_status(CARD_A, STATUS_UPLOADED) == ["a.csv", "b.csv"]
 
 
 def test_connected_soak_pings_every_tick_when_the_intervals_match(caplog_logger, caplog):
@@ -1218,3 +1256,295 @@ def test_sent_at_is_rfc3339_utc_and_matches_the_server_contract():
 
     assert rendered == "2026-07-28T18:30:00Z"
     assert RFC3339_UTC_PATTERN.match(rendered)
+
+
+# --- card_uuid rules (must match the server) ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "A",
+        "1234-ABCD",
+        "a" * 64,
+        "11111111-2222-3333-4444-555555555555",
+        "ABCD1234",
+        "-leading-hyphen",
+    ],
+)
+def test_safe_card_uuids_are_accepted(value):
+    assert is_safe_card_uuid(value) is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "a" * 65,
+        "has space",
+        "has/slash",
+        "has\\backslash",
+        "under_score",
+        "dot.separated",
+        "nul\x00",
+        "newline\n",
+        # `$` would match before a final newline; the rule must not.
+        "1234-ABCD\n",
+        "tab\t",
+        "unicode-ü",
+        "..",
+        ".",
+        7,
+        None,
+    ],
+)
+def test_unsafe_card_uuids_are_rejected(value):
+    assert is_safe_card_uuid(value) is False
+
+
+def test_pi_and_server_card_uuid_rules_agree():
+    """The Pi must never send a card_uuid the server would reject."""
+    from main import validate_card_uuid
+
+    accepted = ["A", "1234-ABCD", "a" * 64, "11111111-2222-3333-4444-555555555555"]
+    rejected = ["", "a" * 65, "has/slash", "under_score", "1234-ABCD\n", ".."]
+
+    for value in accepted:
+        assert is_safe_card_uuid(value) is True
+        assert validate_card_uuid(value) == value
+    for value in rejected:
+        assert is_safe_card_uuid(value) is False
+        with pytest.raises(ValueError):
+            validate_card_uuid(value)
+
+
+def test_upload_refuses_an_unsafe_card_uuid_without_sending_anything():
+    opener = FakeOpener()
+    with pytest.raises(UploadError) as excinfo:
+        send_upload(BASE_CONFIG, "pi", "../escape", "a.csv", b"a", opener=opener)
+
+    assert excinfo.value.category == "unsafe_card_uuid"
+    assert opener.requests == []
+
+
+# --- Criterion 7: the nested per-card queue -----------------------------------
+
+
+def test_only_two_level_regular_files_are_queued(queue_config, ledger):
+    enqueue(queue_config, ledger, "b.csv", card_uuid=CARD_B)
+    enqueue(queue_config, ledger, "a.csv", card_uuid=CARD_A)
+
+    assert queued_entries(queue_config) == [(CARD_A, "a.csv"), (CARD_B, "b.csv")]
+
+
+def test_entries_are_ordered_by_card_then_filename(queue_config, ledger):
+    for card, name in ((CARD_B, "z.csv"), (CARD_A, "c.csv"), (CARD_B, "a.csv"), (CARD_A, "a.csv")):
+        enqueue(queue_config, ledger, name, card_uuid=card)
+
+    assert queued_entries(queue_config) == [
+        (CARD_A, "a.csv"),
+        (CARD_A, "c.csv"),
+        (CARD_B, "a.csv"),
+        (CARD_B, "z.csv"),
+    ]
+
+
+def test_a_flat_file_at_the_top_of_the_queue_is_reported_not_uploaded(queue_config):
+    """Phase 2 queue debris has no card identity, so it cannot be sent."""
+    (queue_config.pending_dir / "logger-0001.csv").write_bytes(b"orphan")
+
+    scan = scan_pending(queue_config)
+
+    assert scan.entries == []
+    assert scan.skipped == ["logger-0001.csv"]
+
+
+def test_a_symlinked_card_directory_is_never_followed(queue_config, ledger, tmp_path):
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "secret.csv").write_bytes(b"not ours\n")
+    (queue_config.pending_dir / CARD_B).symlink_to(outside)
+    enqueue(queue_config, ledger, "a.csv", card_uuid=CARD_A)
+
+    scan = scan_pending(queue_config)
+
+    assert scan.entries == [(CARD_A, "a.csv")]
+    assert CARD_B in scan.skipped
+
+
+def test_a_symlinked_queue_entry_is_never_followed(queue_config, ledger, tmp_path):
+    secret = tmp_path / "outside.csv"
+    secret.write_bytes(b"not ours\n")
+    enqueue(queue_config, ledger, "a.csv")
+    (queue_config.pending_dir_for(CARD_A) / "link.csv").symlink_to(secret)
+
+    scan = scan_pending(queue_config)
+
+    assert scan.entries == [(CARD_A, "a.csv")]
+    assert f"{CARD_A}/link.csv" in scan.skipped
+
+
+def test_a_directory_nested_below_a_card_directory_is_not_descended_into(queue_config, ledger):
+    enqueue(queue_config, ledger, "a.csv")
+    (queue_config.pending_dir_for(CARD_A) / "deeper").mkdir()
+    (queue_config.pending_dir_for(CARD_A) / "deeper" / "b.csv").write_bytes(b"x")
+
+    scan = scan_pending(queue_config)
+
+    assert scan.entries == [(CARD_A, "a.csv")]
+    assert f"{CARD_A}/deeper" in scan.skipped
+
+
+def test_a_malformed_queue_entry_is_logged_and_left_in_place(
+    queue_config, ledger, caplog_logger, caplog
+):
+    (queue_config.pending_dir / "stray.csv").write_bytes(b"x")
+    opener = FakeOpener()
+    state = StateLogger(caplog_logger, 300.0, clock=FakeClock())
+
+    batch = upload_pending(queue_config, "pi", ledger, state, opener=opener)
+
+    assert (batch.attempted, batch.rejected) == (0, 1)
+    assert opener.requests == []
+    assert (queue_config.pending_dir / "stray.csv").exists()
+    assert "not a pending/<card_uuid>/<filename> file" in caplog.text
+
+
+def test_an_unsafe_card_directory_name_is_skipped_and_never_sent(
+    queue_config, ledger, caplog_logger
+):
+    unsafe = queue_config.pending_dir / "not_a_uuid"
+    unsafe.mkdir(parents=True)
+    (unsafe / "a.csv").write_bytes(b"x")
+    opener = FakeOpener()
+    state = StateLogger(caplog_logger, 300.0, clock=FakeClock())
+
+    batch = upload_pending(queue_config, "pi", ledger, state, opener=opener)
+
+    assert (batch.attempted, batch.rejected) == (0, 1)
+    assert opener.requests == []
+    assert (unsafe / "a.csv").exists()
+
+
+def test_files_from_two_cards_are_each_sent_with_their_own_card_uuid(
+    queue_config, ledger, caplog_logger
+):
+    """Criterion 6/7: the same filename on two cards is two uploads."""
+    enqueue(queue_config, ledger, "logger-0001.csv", b"card a\n", card_uuid=CARD_A)
+    enqueue(queue_config, ledger, "logger-0001.csv", b"card b\n", card_uuid=CARD_B)
+    opener = FakeOpener(
+        [
+            upload_ack("logger-0001.csv", 7, card_uuid=CARD_A),
+            upload_ack("logger-0001.csv", 7, card_uuid=CARD_B),
+        ]
+    )
+    state = StateLogger(caplog_logger, 300.0, clock=FakeClock())
+
+    batch = upload_pending(queue_config, "pi", ledger, state, opener=opener)
+
+    assert (batch.attempted, batch.uploaded) == (2, 2)
+    sent = [
+        (
+            parse_multipart(request.data, request.get_header("Content-type"))["card_uuid"],
+            parse_multipart(request.data, request.get_header("Content-type"))["file"],
+        )
+        for request, _ in opener.requests
+    ]
+    assert sent == [(CARD_A.encode(), b"card a\n"), (CARD_B.encode(), b"card b\n")]
+    assert ledger.status_of(CARD_A, "logger-0001.csv") == STATUS_UPLOADED
+    assert ledger.status_of(CARD_B, "logger-0001.csv") == STATUS_UPLOADED
+
+
+def test_an_emptied_card_directory_is_cleaned_up(queue_config, ledger, caplog_logger):
+    enqueue(queue_config, ledger, "a.csv")
+    enqueue(queue_config, ledger, "b.csv", card_uuid=CARD_B)
+    opener = FakeOpener([upload_ack("a.csv", 8), upload_ack("b.csv", 8, card_uuid=CARD_B)])
+    state = StateLogger(caplog_logger, 300.0, clock=FakeClock())
+
+    upload_pending(queue_config, "pi", ledger, state, opener=opener)
+
+    assert sorted(entry.name for entry in queue_config.pending_dir.iterdir()) == []
+
+
+def test_a_card_directory_with_files_left_is_not_removed(queue_config, ledger, caplog_logger):
+    enqueue(queue_config, ledger, "a.csv")
+    enqueue(queue_config, ledger, "b.csv")
+    opener = FakeOpener([upload_ack("a.csv", 8), http_error(503, UPLOAD_URL)])
+    state = StateLogger(caplog_logger, 300.0, clock=FakeClock())
+
+    upload_pending(queue_config, "pi", ledger, state, opener=opener)
+
+    assert queued_entries(queue_config) == [(CARD_A, "b.csv")]
+
+
+# --- Criterion 10: acknowledgement safety -------------------------------------
+
+
+def test_a_mismatched_card_uuid_leaves_the_file_pending(queue_config, ledger, caplog_logger):
+    """The acknowledgement is the only evidence used to delete a local copy."""
+    enqueue(queue_config, ledger, "logger-0001.csv")
+    opener = FakeOpener([upload_ack("logger-0001.csv", 8, card_uuid=CARD_B)])
+    state = StateLogger(caplog_logger, 300.0, clock=FakeClock())
+
+    batch = upload_pending(queue_config, "pi", ledger, state, opener=opener)
+
+    assert (batch.uploaded, batch.failed) == (0, 1)
+    assert ledger.status_of(CARD_A, "logger-0001.csv") == STATUS_PENDING
+    assert (queue_config.pending_dir_for(CARD_A) / "logger-0001.csv").exists()
+
+
+def test_a_missing_card_uuid_in_the_acknowledgement_leaves_the_file_pending(
+    queue_config, ledger, caplog_logger
+):
+    enqueue(queue_config, ledger, "logger-0001.csv")
+    payload = ack_payload(filename="logger-0001.csv", size=8, card_uuid=None)
+    opener = FakeOpener([FakeResponse(200, json.dumps(payload).encode())])
+    state = StateLogger(caplog_logger, 300.0, clock=FakeClock())
+
+    batch = upload_pending(queue_config, "pi", ledger, state, opener=opener)
+
+    assert batch.uploaded == 0
+    assert ledger.status_of(CARD_A, "logger-0001.csv") == STATUS_PENDING
+
+
+@pytest.mark.parametrize("status", ["stored", "already_stored"])
+def test_a_matching_acknowledgement_marks_exactly_that_identity_uploaded(
+    queue_config, ledger, caplog_logger, status
+):
+    enqueue(queue_config, ledger, "logger-0001.csv", card_uuid=CARD_A)
+    enqueue(queue_config, ledger, "logger-0001.csv", card_uuid=CARD_B)
+    opener = FakeOpener(
+        [
+            upload_ack("logger-0001.csv", 8, card_uuid=CARD_A, status=status),
+            # Card B's identical filename fails, so only card A can be closed out.
+            http_error(503, UPLOAD_URL),
+        ]
+    )
+    state = StateLogger(caplog_logger, 300.0, clock=FakeClock())
+
+    upload_pending(queue_config, "pi", ledger, state, opener=opener)
+
+    assert ledger.status_of(CARD_A, "logger-0001.csv") == STATUS_UPLOADED
+    assert ledger.status_of(CARD_B, "logger-0001.csv") == STATUS_PENDING
+    assert not (queue_config.pending_dir_for(CARD_A) / "logger-0001.csv").exists()
+    assert (queue_config.pending_dir_for(CARD_B) / "logger-0001.csv").exists()
+
+
+# --- Criterion 12: a restart keeps nested queues deliverable ------------------
+
+
+def test_a_restart_finds_the_nested_queue_and_delivers_it(queue_config, ledger, caplog_logger):
+    """Stands in for a reboot between queueing and uploading."""
+    enqueue(queue_config, ledger, "a.csv", b"12345", card_uuid=CARD_A)
+    enqueue(queue_config, ledger, "b.csv", b"12345", card_uuid=CARD_B)
+
+    # A fresh ledger handle over the same files, as a restarted process sees it.
+    restarted = Ledger(queue_config.state_db_path)
+    assert queued_entries(queue_config) == [(CARD_A, "a.csv"), (CARD_B, "b.csv")]
+
+    opener = FakeOpener([upload_ack("a.csv", 5), upload_ack("b.csv", 5, card_uuid=CARD_B)])
+    state = StateLogger(caplog_logger, 300.0, clock=FakeClock())
+    batch = upload_pending(queue_config, "pi", restarted, state, opener=opener)
+
+    assert batch.uploaded == 2
+    assert queued_entries(queue_config) == []

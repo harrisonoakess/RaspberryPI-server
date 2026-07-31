@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 #
-# Idempotent installer for the Phase 2 SD card ingestion + upload services.
+# Idempotent installer for the Phase 3 SD card ingestion + upload services.
 # Re-running it is safe: it converges on the same state and never overwrites an
-# existing /etc/piuploader/config.env, queue, or ledger. Upgrading from Phase 1
-# replaces connectivity-daemon.service with uploader.service and
-# sdcard-watcher.service.
+# existing /etc/piuploader/config.env, queue, or ledger.
+#
+# No card needs to be inserted. Phase 3 detects and mounts any qualifying card
+# at runtime (sdcard-mounter.service), so nothing card-specific is pinned here.
+# Upgrading from Phase 2 removes the UUID-pinned udev rule and mount helper.
 #
 # Usage:  sudo ./setup.sh [options]
 #   --skip-hardware-check     install on non-Pi hardware (development)
-#   --card-device /dev/sda1   name the card partition instead of auto-detecting
-#   --redetect-card           overwrite a CARD_UUID already in config.env
-#   --skip-card-detection     install the services without touching the card
-#                             config (for re-runs with no card inserted)
+#   --reset-phase2-state      delete Phase 2 ledger/queue state, which Phase 3
+#                             cannot read (see prd/phase-3-multi-card-ingestion.md §7.1)
 #
 set -euo pipefail
 
@@ -23,35 +23,28 @@ LOG_DIR="/var/log/piuploader"
 STATE_DIR="/var/lib/piuploader"
 REPORT_FILE="${LOG_DIR}/environment-report.txt"
 HELPER_DIR="/usr/local/lib/piuploader"
-MOUNT_HELPER="${HELPER_DIR}/mount-card.sh"
-UDEV_RULE="/etc/udev/rules.d/99-piuploader-sdcard.rules"
 
+# Phase 2 leftovers. Card mounting is a service now, not a udev rule.
+LEGACY_MOUNT_HELPER="${HELPER_DIR}/mount-card.sh"
+LEGACY_UDEV_RULE="/etc/udev/rules.d/99-piuploader-sdcard.rules"
 LEGACY_UNIT="connectivity-daemon.service"
-UNITS=("uploader.service" "sdcard-watcher.service")
-PYTHON_MODULES=("uploader.py" "sdcard_watcher.py" "state.py")
 
-# Filesystems this installer will mount. Anything else fails setup rather than
-# being mounted with guessed options.
+UNITS=("uploader.service" "sdcard-watcher.service" "sdcard-mounter.service")
+PYTHON_MODULES=("uploader.py" "sdcard_watcher.py" "sdcard_mounter.py" "state.py")
+
+# Filesystems the mounter will accept at runtime. Reported here so a missing
+# kernel driver is visible at install time rather than at card insertion.
 SUPPORTED_FILESYSTEMS=("vfat" "exfat" "ext4" "ext3" "ext2")
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SKIP_HARDWARE_CHECK=0
-SKIP_CARD_DETECTION=0
-REDETECT_CARD=0
-CARD_DEVICE=""
+RESET_PHASE2_STATE=0
 FAILED=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --skip-hardware-check) SKIP_HARDWARE_CHECK=1 ;;
-    --skip-card-detection) SKIP_CARD_DETECTION=1 ;;
-    --redetect-card) REDETECT_CARD=1 ;;
-    --card-device)
-      shift
-      [[ $# -gt 0 ]] || { echo "--card-device needs a value" >&2; exit 2; }
-      CARD_DEVICE="$1"
-      ;;
-    --card-device=*) CARD_DEVICE="${1#*=}" ;;
+    --reset-phase2-state) RESET_PHASE2_STATE=1 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -93,10 +86,6 @@ PYTHON_VERSION="missing"
 SYSTEMD_VERSION="missing"
 command -v systemctl >/dev/null 2>&1 && SYSTEMD_VERSION="$(systemctl --version | head -n1)"
 
-SYSTEMD_MOUNT="$(command -v systemd-mount || true)"
-SYSTEMD_UMOUNT="$(command -v systemd-umount || true)"
-MOUNTPOINT_BIN="$(command -v mountpoint || true)"
-
 # Detected built-in wireless adapter. `iw dev` is authoritative; fall back to sysfs.
 DETECTED_WIFI=""
 if command -v iw >/dev/null 2>&1; then
@@ -133,6 +122,9 @@ fi
 
 [[ -z "${PYTHON_BIN}" ]] && fail "python3 is required but not installed"
 [[ "${SYSTEMD_VERSION}" == "missing" ]] && fail "systemd (systemctl) is required but not available"
+command -v lsblk >/dev/null 2>&1 || fail "lsblk is required by sdcard-mounter but is not installed"
+command -v findmnt >/dev/null 2>&1 || fail "findmnt is required by sdcard-mounter but is not installed"
+command -v mount >/dev/null 2>&1 || fail "mount is required by sdcard-mounter but is not installed"
 
 # device_id is derived from the hostname at runtime; it must satisfy the
 # server's validation rules (1-63 chars, alphanumeric ends, internal hyphens).
@@ -166,9 +158,9 @@ fi
 install -d -o root -g "${SERVICE_USER}" -m 0750 "${CONFIG_DIR}"
 install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0750 "${LOG_DIR}"
 install -d -o root -g root -m 0755 "${INSTALL_DIR}"
-install -d -o root -g root -m 0755 "${HELPER_DIR}"
-# Queue and ledger. Created if absent, never emptied: an existing queue holds
-# files that have not reached the server yet.
+# Queue and ledger. Created if absent, never emptied except by an explicit
+# --reset-phase2-state: an existing queue holds files that have not reached the
+# server yet.
 install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0750 "${STATE_DIR}"
 install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0750 "${STATE_DIR}/queue"
 install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0750 "${STATE_DIR}/queue/pending"
@@ -207,22 +199,13 @@ ensure_config_key() {
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${key}" "${value}" >> "${CONFIG_FILE}"
 }
 
-replace_config_key() {
-  local key="$1" value="$2"
-  if config_has_key "${key}"; then
-    log "updating ${key}=${value} in ${CONFIG_FILE}"
-    sed -i -E "s|^[[:space:]]*${key}=.*|${key}=${value}|" "${CONFIG_FILE}"
-  else
-    ensure_config_key "${key}" "${value}"
-  fi
-}
-
 ensure_config_key "QUEUE_PATH" "${STATE_DIR}/queue"
 ensure_config_key "STATE_DB_PATH" "${STATE_DIR}/state.db"
-ensure_config_key "MAX_UPLOAD_BYTES" "10485760"
+ensure_config_key "MAX_UPLOAD_BYTES" "20971520"
 ensure_config_key "PING_INTERVAL_SECONDS" "300"
 ensure_config_key "UPLOAD_TIMEOUT_SECONDS" "120"
 ensure_config_key "CARD_MOUNTPOINT" "/mnt/sdcard"
+ensure_config_key "CARD_MOUNT_INTERVAL_SECONDS" "2"
 
 CARD_MOUNTPOINT="$(config_value CARD_MOUNTPOINT)"
 [[ -n "${CARD_MOUNTPOINT}" ]] || die "CARD_MOUNTPOINT is empty in ${CONFIG_FILE}"
@@ -232,182 +215,126 @@ case "${CARD_MOUNTPOINT}" in
 esac
 install -d -o root -g root -m 0755 "${CARD_MOUNTPOINT}"
 
+# Phase 2 pinned one card here. Phase 3 ignores both keys; say so once rather
+# than editing a file the operator owns.
+if config_has_key "CARD_UUID" || config_has_key "CARD_FILESYSTEM"; then
+  log "note: CARD_UUID/CARD_FILESYSTEM in ${CONFIG_FILE} are ignored in Phase 3 and can be deleted"
+fi
+
 # ---------------------------------------------------------------------------
-# 3. SD card detection (PRD §4, §6)
+# 3. Phase 2 state guard (PRD §7.1)
 # ---------------------------------------------------------------------------
+# The ledger's primary key, the queue layout, and the server's uniqueness
+# constraint all changed. Phase 2 state cannot be read under the new schema, so
+# it is reset explicitly or setup stops.
 
-CARD_UUID="$(config_value CARD_UUID)"
-CARD_FILESYSTEM="$(config_value CARD_FILESYSTEM)"
+STATE_DB="${STATE_DIR}/state.db"
+SCHEMA_STATE="$("${PYTHON_BIN}" "${SCRIPT_DIR}/state.py" --schema-state "${STATE_DB}" 2>/dev/null || echo unreadable)"
+FLAT_QUEUED="$(find "${STATE_DIR}/queue/pending" -mindepth 1 -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')"
 
-filesystem_is_supported() {
-  local fs="$1" supported
-  for supported in "${SUPPORTED_FILESYSTEMS[@]}"; do
-    [[ "${fs}" == "${supported}" ]] || continue
-    # Supported by this installer; now check the kernel can actually mount it.
-    grep -qw "${fs}" /proc/filesystems && return 0
-    modprobe -q "${fs}" 2>/dev/null && grep -qw "${fs}" /proc/filesystems && return 0
-    [[ -x "/sbin/mount.${fs}" || -x "/usr/sbin/mount.${fs}" ]] && return 0
-    return 2   # recognised but unmountable here
-  done
-  return 1     # not supported by this installer
-}
+NEEDS_RESET=0
+case "${SCHEMA_STATE}" in
+  legacy)     NEEDS_RESET=1; log "found a Phase 2 ledger at ${STATE_DB}" ;;
+  unreadable) NEEDS_RESET=1; warn "cannot read ${STATE_DB}; treating it as Phase 2 state" ;;
+  absent|phase3) : ;;
+  *)          NEEDS_RESET=1; warn "unexpected ledger state '${SCHEMA_STATE}'; treating it as Phase 2 state" ;;
+esac
+if [[ "${FLAT_QUEUED}" -gt 0 ]]; then
+  NEEDS_RESET=1
+  log "found ${FLAT_QUEUED} Phase 2 queue file(s) directly under ${STATE_DIR}/queue/pending"
+fi
 
-# Pull one KEY="value" pair out of an `lsblk -P` line. Parsed with a bash regex
-# rather than eval, so no device or filesystem name is ever executed as shell.
-lsblk_field() {
-  local key="$1" line="$2"
-  if [[ "${line}" =~ (^|[[:space:]])${key}=\"([^\"]*)\" ]]; then
-    printf '%s' "${BASH_REMATCH[2]}"
-  fi
-}
+if [[ "${NEEDS_RESET}" -eq 1 && "${RESET_PHASE2_STATE}" -eq 0 ]]; then
+  cat >&2 <<EOF
+[setup] ERROR: Phase 2 local state is present and Phase 3 cannot read it.
+[setup]   ledger: ${STATE_DB} (${SCHEMA_STATE})
+[setup]   flat queue files under ${STATE_DIR}/queue/pending: ${FLAT_QUEUED}
+[setup]
+[setup] Phase 3 keys the ledger on (card_uuid, filename) and the queue on
+[setup] pending/<card_uuid>/<filename>. Re-run with --reset-phase2-state to
+[setup] delete the ledger and the queue contents and start clean:
+[setup]
+[setup]   sudo ./setup.sh --reset-phase2-state
+[setup]
+[setup] That permanently discards any file queued but not yet uploaded. The
+[setup] cards are never cleared, so their files are re-ingested afterwards.
+[setup] config.env, the API key, and logs are not touched.
+EOF
+  exit 1
+fi
 
-# Removable partitions that carry a filesystem, excluding the disk that holds /.
-list_card_candidates() {
-  local root_source root_disk
-  root_source="$(findmnt -no SOURCE / 2>/dev/null || true)"
-  root_disk=""
-  [[ -n "${root_source}" ]] && root_disk="$(lsblk -no PKNAME "${root_source}" 2>/dev/null | head -n1 || true)"
-
-  local line device type removable hotplug fstype uuid parent
-  while IFS= read -r line; do
-    type="$(lsblk_field TYPE "${line}")"
-    [[ "${type}" == "part" ]] || continue
-    # Some USB card readers report RM=0 and only set HOTPLUG=1.
-    removable="$(lsblk_field RM "${line}")"
-    hotplug="$(lsblk_field HOTPLUG "${line}")"
-    [[ "${removable}" == "1" || "${hotplug}" == "1" ]] || continue
-    fstype="$(lsblk_field FSTYPE "${line}")"
-    uuid="$(lsblk_field UUID "${line}")"
-    [[ -n "${uuid}" && -n "${fstype}" ]] || continue
-    parent="$(lsblk_field PKNAME "${line}")"
-    [[ -n "${root_disk}" && "${parent}" == "${root_disk}" ]] && continue
-    device="$(lsblk_field PATH "${line}")"
-    printf '%s\t%s\t%s\n' "${device}" "${fstype}" "${uuid}"
-  done < <(lsblk -P -o PATH,TYPE,RM,HOTPLUG,FSTYPE,UUID,PKNAME)
-}
-
-if [[ "${SKIP_CARD_DETECTION}" -eq 1 ]]; then
-  log "skipping card detection (--skip-card-detection)"
-elif [[ -n "${CARD_UUID}" && "${REDETECT_CARD}" -eq 0 ]]; then
-  log "card already configured: UUID=${CARD_UUID} filesystem=${CARD_FILESYSTEM:-unrecorded}"
-  log "pass --redetect-card to replace it with a different card"
-else
-  command -v lsblk >/dev/null 2>&1 || die "lsblk is required to detect the card"
-
-  DETECTED_FS=""
-  DETECTED_UUID=""
-
-  if [[ -n "${CARD_DEVICE}" ]]; then
-    [[ -b "${CARD_DEVICE}" ]] || die "${CARD_DEVICE} is not a block device"
-    DETECTED_FS="$(lsblk -no FSTYPE "${CARD_DEVICE}" | head -n1 | tr -d '[:space:]')"
-    DETECTED_UUID="$(lsblk -no UUID "${CARD_DEVICE}" | head -n1 | tr -d '[:space:]')"
-    if [[ -z "${DETECTED_UUID}" ]] && command -v blkid >/dev/null 2>&1; then
-      DETECTED_UUID="$(blkid -s UUID -o value "${CARD_DEVICE}" || true)"
-      DETECTED_FS="${DETECTED_FS:-$(blkid -s TYPE -o value "${CARD_DEVICE}" || true)}"
-    fi
-    [[ -n "${DETECTED_UUID}" ]] || die "${CARD_DEVICE} has no filesystem UUID; format the card first"
-    log "using the card given on the command line: ${CARD_DEVICE}"
+if [[ "${RESET_PHASE2_STATE}" -eq 1 ]]; then
+  if [[ "${NEEDS_RESET}" -eq 0 ]]; then
+    log "--reset-phase2-state: no Phase 2 state found, nothing to reset"
   else
-    mapfile -t CANDIDATES < <(list_card_candidates)
-    if [[ "${#CANDIDATES[@]}" -eq 0 ]]; then
-      echo "[setup] ERROR: no removable partition with a filesystem was found." >&2
-      echo "[setup] Insert the logger's SD card, then re-run. Current block devices:" >&2
-      lsblk --fs >&2 || true
-      exit 1
-    fi
-    if [[ "${#CANDIDATES[@]}" -gt 1 ]]; then
-      echo "[setup] ERROR: more than one removable partition was found; name the card explicitly." >&2
-      printf '[setup]   %s\n' "${CANDIDATES[@]}" >&2
-      echo "[setup] Re-run with: sudo ./setup.sh --card-device /dev/sdX1" >&2
-      exit 1
-    fi
-    IFS=$'\t' read -r CARD_DEVICE DETECTED_FS DETECTED_UUID <<< "${CANDIDATES[0]}"
-    log "detected one removable card: ${CARD_DEVICE}"
+    log "--reset-phase2-state: stopping services before touching local state"
+    systemctl stop "${UNITS[@]}" >/dev/null 2>&1 || true
+
+    log "deleting the Phase 2 ledger and queue contents"
+    rm -f "${STATE_DB}" "${STATE_DB}-wal" "${STATE_DB}-shm"
+    # -mindepth 1 keeps the directories themselves and covers dotfiles.
+    find "${STATE_DIR}/queue/pending" -mindepth 1 -delete 2>/dev/null || true
+    find "${STATE_DIR}/queue/tmp" -mindepth 1 -delete 2>/dev/null || true
+    install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0750 "${STATE_DIR}/queue/pending"
+    install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0750 "${STATE_DIR}/queue/tmp"
+    log "reset complete; config.env, credentials, and logs were left alone"
   fi
-
-  log "card filesystem: ${DETECTED_FS:-unknown}"
-  log "card UUID:       ${DETECTED_UUID}"
-
-  set +e
-  filesystem_is_supported "${DETECTED_FS}"
-  FS_STATUS=$?
-  set -e
-  case "${FS_STATUS}" in
-    0) : ;;
-    2) die "filesystem '${DETECTED_FS}' is recognised but this kernel cannot mount it; install its driver (for exfat: 'sudo apt-get install exfatprogs') and re-run" ;;
-    *) die "filesystem '${DETECTED_FS:-unknown}' on ${CARD_DEVICE} is not supported; supported: ${SUPPORTED_FILESYSTEMS[*]}" ;;
-  esac
-
-  replace_config_key "CARD_UUID" "${DETECTED_UUID}"
-  replace_config_key "CARD_FILESYSTEM" "${DETECTED_FS}"
-  CARD_UUID="${DETECTED_UUID}"
-  CARD_FILESYSTEM="${DETECTED_FS}"
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Root-owned read-only mount (udev rule + helper)
+# 4. Remove the Phase 2 UUID-pinned mount (PRD §5.1)
 # ---------------------------------------------------------------------------
-# The services are unprivileged, so root provisions the mount: udev sees the
-# configured UUID appear and asks PID 1 to mount it read-only with
-# nodev,nosuid,noexec. The watcher only ever reads that mountpoint.
+# Mounting is sdcard-mounter.service's job now. Leaving the old rule in place
+# would race it for the same mountpoint.
 
-if [[ -z "${CARD_UUID}" ]]; then
-  warn "no CARD_UUID configured, so no mount rule was installed; the watcher will not start until you re-run setup.sh with the card inserted"
-elif [[ -z "${SYSTEMD_MOUNT}" ]]; then
-  warn "systemd-mount was not found, so no mount rule was installed; mount ${CARD_MOUNTPOINT} read-only by another means"
-else
-  install -d -o root -g root -m 0755 "${HELPER_DIR}"
-  cat > "${MOUNT_HELPER}" <<EOF
-#!/usr/bin/env bash
-# Installed by pi/setup.sh — do not edit; re-run setup.sh instead.
-# Called by udev when the configured card appears. Mounts it read-only for the
-# unprivileged piuploader services. systemd-mount hands the work to PID 1, so
-# the mount outlives this short-lived udev worker.
-set -u
-DEVNODE="\${1:-}"
-[[ -n "\${DEVNODE}" ]] || exit 1
-
-# A hot-unplug can leave the previous mount behind; clear it before remounting.
-if ${MOUNTPOINT_BIN:-/usr/bin/mountpoint} -q "${CARD_MOUNTPOINT}"; then
-  ${SYSTEMD_UMOUNT:-/usr/bin/systemd-umount} "${CARD_MOUNTPOINT}" 2>/dev/null || \
-    umount -l "${CARD_MOUNTPOINT}" 2>/dev/null || true
-fi
-
-exec ${SYSTEMD_MOUNT} --no-block --collect \\
-  --type="${CARD_FILESYSTEM}" \\
-  --options=ro,nodev,nosuid,noexec \\
-  "\${DEVNODE}" "${CARD_MOUNTPOINT}"
-EOF
-  chown root:root "${MOUNT_HELPER}"
-  chmod 0755 "${MOUNT_HELPER}"
-
-  cat > "${UDEV_RULE}" <<EOF
-# Installed by pi/setup.sh — do not edit; re-run setup.sh instead.
-# Exactly one card is accepted, matched by filesystem UUID. No other removable
-# drive is ever mounted at ${CARD_MOUNTPOINT}.
-ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_UUID}=="${CARD_UUID}", RUN+="${MOUNT_HELPER} \$devnode"
-ACTION=="remove", SUBSYSTEM=="block", ENV{ID_FS_UUID}=="${CARD_UUID}", RUN+="${SYSTEMD_UMOUNT:-/usr/bin/systemd-umount} ${CARD_MOUNTPOINT}"
-EOF
-  chown root:root "${UDEV_RULE}"
-  chmod 0644 "${UDEV_RULE}"
-  log "installed ${UDEV_RULE} for UUID ${CARD_UUID} (${CARD_FILESYSTEM})"
-
+if [[ -f "${LEGACY_UDEV_RULE}" ]]; then
+  log "removing the Phase 2 udev mount rule ${LEGACY_UDEV_RULE}"
+  rm -f "${LEGACY_UDEV_RULE}"
   if command -v udevadm >/dev/null 2>&1; then
     udevadm control --reload-rules
     log "reloaded udev rules"
   else
-    warn "udevadm not found; reboot for the card rule to take effect"
+    warn "udevadm not found; reboot to drop the old card rule"
   fi
+fi
+if [[ -f "${LEGACY_MOUNT_HELPER}" ]]; then
+  log "removing the Phase 2 mount helper ${LEGACY_MOUNT_HELPER}"
+  rm -f "${LEGACY_MOUNT_HELPER}"
+fi
+
+# Report which supported filesystems this kernel can actually mount, so a
+# missing driver shows up now instead of when a card is inserted.
+filesystem_is_mountable() {
+  local fs="$1"
+  grep -qw "${fs}" /proc/filesystems && return 0
+  modprobe -q "${fs}" 2>/dev/null && grep -qw "${fs}" /proc/filesystems && return 0
+  [[ -x "/sbin/mount.${fs}" || -x "/usr/sbin/mount.${fs}" ]] && return 0
+  return 1
+}
+
+MOUNTABLE_FILESYSTEMS=()
+UNMOUNTABLE_FILESYSTEMS=()
+for fs in "${SUPPORTED_FILESYSTEMS[@]}"; do
+  if filesystem_is_mountable "${fs}"; then
+    MOUNTABLE_FILESYSTEMS+=("${fs}")
+  else
+    UNMOUNTABLE_FILESYSTEMS+=("${fs}")
+  fi
+done
+log "card filesystems this kernel can mount: ${MOUNTABLE_FILESYSTEMS[*]:-none}"
+if [[ "${#UNMOUNTABLE_FILESYSTEMS[@]}" -gt 0 ]]; then
+  warn "a card formatted ${UNMOUNTABLE_FILESYSTEMS[*]} cannot be mounted here (for exfat: 'sudo apt-get install exfatprogs')"
 fi
 
 # ---------------------------------------------------------------------------
 # 5. Optional pyudev fast path
 # ---------------------------------------------------------------------------
-# Without pyudev the watcher polls for the card on CARD_SCAN_INTERVAL_SECONDS
-# instead of reacting to the udev event. That costs latency, not correctness.
+# Without pyudev the watcher polls on CARD_SCAN_INTERVAL_SECONDS instead of
+# reacting to the udev event. That costs latency, not correctness. The mounter
+# polls regardless.
 
 if "${PYTHON_BIN}" -c 'import pyudev' >/dev/null 2>&1; then
-  log "pyudev is available (card insertions are detected immediately)"
+  log "pyudev is available (card insertions are noticed immediately)"
 elif command -v apt-get >/dev/null 2>&1; then
   log "installing python3-pyudev"
   if ! apt-get install -y python3-pyudev >/dev/null 2>&1; then
@@ -458,14 +385,12 @@ fi
 if grep -q '^SERVER_URL=https://your-service.up.railway.app$' "${CONFIG_FILE}"; then
   warn "${CONFIG_FILE} still has the placeholder SERVER_URL"
 fi
-if [[ -z "$(config_value CARD_UUID)" ]]; then
-  warn "CARD_UUID is not set; sdcard-watcher will exit with a configuration error until you re-run setup.sh with the card inserted"
-fi
 
-QUEUED_COUNT="$(find "${STATE_DIR}/queue/pending" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')"
+QUEUED_COUNT="$(find "${STATE_DIR}/queue/pending" -mindepth 2 -maxdepth 2 -type f 2>/dev/null | wc -l | tr -d ' ')"
+QUEUED_CARDS="$(find "${STATE_DIR}/queue/pending" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
 
 {
-  echo "Phase 2 environment report — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "Phase 3 environment report — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "Pi model:             ${PI_MODEL}"
   echo "OS:                   ${OS_NAME}"
   echo "OS version:           ${OS_VERSION}"
@@ -476,11 +401,10 @@ QUEUED_COUNT="$(find "${STATE_DIR}/queue/pending" -maxdepth 1 -type f 2>/dev/nul
   echo "Detected WiFi:        ${DETECTED_WIFI}"
   echo "Configured WiFi:      ${CONFIGURED_WIFI}"
   echo "Hostname / device_id: ${HOSTNAME_SHORT}"
-  echo "Card UUID:            $(config_value CARD_UUID)"
-  echo "Card filesystem:      $(config_value CARD_FILESYSTEM)"
   echo "Card mountpoint:      ${CARD_MOUNTPOINT}"
-  echo "Card device at setup: ${CARD_DEVICE:-not detected this run}"
-  echo "Queue:                ${STATE_DIR}/queue (${QUEUED_COUNT} file(s) pending)"
+  echo "Mount interval:       $(config_value CARD_MOUNT_INTERVAL_SECONDS)s"
+  echo "Mountable card FS:    ${MOUNTABLE_FILESYSTEMS[*]:-none}"
+  echo "Queue:                ${STATE_DIR}/queue (${QUEUED_COUNT} file(s) across ${QUEUED_CARDS} card(s))"
   echo "Ledger:               ${STATE_DIR}/state.db"
   echo "pyudev:               $("${PYTHON_BIN}" -c 'import pyudev; print(pyudev.__version__)' 2>/dev/null || echo 'not installed (polling fallback)')"
 } | tee "${REPORT_FILE}"
@@ -488,4 +412,4 @@ chown "${SERVICE_USER}":"${SERVICE_USER}" "${REPORT_FILE}"
 
 log "wrote environment report to ${REPORT_FILE} — copy these values into README.md"
 log "next: edit ${CONFIG_FILE}, then run 'sudo systemctl restart ${UNITS[*]}'"
-log "follow logs with: journalctl -u uploader -u sdcard-watcher -f"
+log "follow logs with: journalctl -u sdcard-mounter -u sdcard-watcher -u uploader -f"

@@ -17,7 +17,7 @@ EnvironmentFile=/etc/piuploader/config.env
 ExecStart=/usr/bin/python3 -u /opt/piuploader/uploader.py
 Restart=on-failure
 RestartSec=10
-# An in-flight 10 MiB upload gets a moment to finish before SIGKILL.
+# An in-flight 20 MiB upload gets a moment to finish before SIGKILL.
 TimeoutStopSec=30
 
 NoNewPrivileges=yes
